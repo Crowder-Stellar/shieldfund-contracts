@@ -1,66 +1,139 @@
 # ShieldFund Contracts
 
-Soroban smart contracts for the ShieldFund ZK treasury platform, deployed on the Stellar blockchain. Three contracts form the on-chain layer: a treasury vault for USDC custody, a real-time payment streaming engine, and a ZK proof registry.
+![CI](https://github.com/Crowder-Stellar/shieldfund-contracts/actions/workflows/ci.yml/badge.svg)
+![Stellar](https://img.shields.io/badge/Stellar-Testnet-blue?logo=stellar)
+![Rust](https://img.shields.io/badge/Rust-1.96-orange?logo=rust)
+![Soroban SDK](https://img.shields.io/badge/Soroban%20SDK-22-blueviolet)
+
+Soroban smart contracts for the ShieldFund ZK treasury platform on Stellar. Three contracts — a treasury vault for token custody, a real-time payment streaming engine, and an on-chain ZK proof registry — form the complete on-chain layer.
 
 ---
 
-## Contracts
+## Live Testnet Deployment
+
+All three contracts are deployed and initialized on **Stellar Testnet** (deployed 2026-06-28).
+
+| Contract | ID | Explorer |
+|----------|----|---------|
+| `treasury_vault` | `CAUWJPC73YLQMSV6X4QPLUVS2UZFE2PMRIQSSCDN62DNN6J76Y5RETIG` | [View →](https://stellar.expert/explorer/testnet/contract/CAUWJPC73YLQMSV6X4QPLUVS2UZFE2PMRIQSSCDN62DNN6J76Y5RETIG) |
+| `streaming` | `CDU7ZIVQ3UC4K3DHV3NMQGW5UMSYFCKCC6YJKHT4YLNEZJRWL6THE6WQ` | [View →](https://stellar.expert/explorer/testnet/contract/CDU7ZIVQ3UC4K3DHV3NMQGW5UMSYFCKCC6YJKHT4YLNEZJRWL6THE6WQ) |
+| `proof_registry` | `CBDLHQQPKC5524CFWPD4HMPTZGWBYQNW3IKGAFH6IAYBU3F2F6AO2332` | [View →](https://stellar.expert/explorer/testnet/contract/CBDLHQQPKC5524CFWPD4HMPTZGWBYQNW3IKGAFH6IAYBU3F2F6AO2332) |
+| XLM Token SAC | `CDLZFC3SYJYDZT7K67VZ75HPJVIEUVNIXF47ZG2FB2RMQQVU2HHGCYSC` | [View →](https://stellar.expert/explorer/testnet/contract/CDLZFC3SYJYDZT7K67VZ75HPJVIEUVNIXF47ZG2FB2RMQQVU2HHGCYSC) |
+| Admin Account | `GBJ5FP5UB4YUE2EONTPPSAGKZZGDETFZLEJXJRCALSYTJZIDVWAN3C7P` | [View →](https://stellar.expert/explorer/testnet/account/GBJ5FP5UB4YUE2EONTPPSAGKZZGDETFZLEJXJRCALSYTJZIDVWAN3C7P) |
+
+---
+
+## Work Breakdown Structure
+
+```
+shieldfund-contracts (Cargo workspace)
+│
+├── treasury_vault          ← Core custody contract
+│   ├── initialize()        one-time setup, sets admin + token SAC
+│   ├── deposit()           user → vault token transfer (auth: depositor)
+│   ├── disburse()          vault → recipient + ZK proof anchor (auth: admin)
+│   ├── get_balance()       read-only: live vault token balance
+│   ├── get_stats()         read-only: { vault_balance, total_raised, total_disbursed }
+│   ├── get_admin()
+│   ├── get_token()
+│   └── transfer_admin()    (auth: current admin)
+│
+├── streaming               ← Real-time payment engine
+│   ├── initialize()        sets admin + token SAC
+│   ├── create_stream()     creates Stream record (auth: admin)
+│   │                       validates contract holds enough tokens first
+│   ├── toggle_stream()     Active ↔ Paused, snapshots accumulated (auth: admin)
+│   ├── get_accumulated()   simulation call: accumulated + elapsed × rate
+│   ├── withdraw()          recipient claims tokens (auth: recipient)
+│   ├── get_stream()        read single Stream record
+│   ├── get_all_streams()   read all Stream records
+│   └── get_admin()
+│
+└── proof_registry          ← ZK proof anchor store
+    ├── initialize()        sets admin
+    ├── register_proof()    stores ProofEntry + hash index (auth: submitter)
+    │                       panics on duplicate hash
+    ├── get_proof()         read by sequential ID
+    ├── get_all_proofs()    read all ProofEntry records
+    ├── verify_proof_exists() bool check by hash (O(1))
+    ├── get_id_by_hash()    reverse lookup: hash → id
+    ├── get_admin()
+    └── transfer_admin()    (auth: current admin)
+```
+
+### How the contracts interact
+
+```
+User (Freighter wallet)
+    │
+    ├─ deposit() ──────────────────► treasury_vault
+    │                                     │ holds tokens
+    └─ register_proof() ──────────► proof_registry
+                                          │ proof_hash stored
+                                          │
+treasury_vault::disburse(proof_hash) ─────┘ (admin links payment to proof)
+    │
+    └─► transfers tokens to recipient
+
+streaming contract
+    │ admin funds it with a token transfer
+    └─► create_stream() → per-second drip to recipient
+        withdraw()      → recipient claims accumulated tokens
+```
+
+---
+
+## Contracts Reference
 
 ### `treasury_vault`
 
-Multi-sig treasury that holds USDC and gates disbursements behind ZK proof verification.
+| Function | Auth | Parameters | Returns |
+|----------|------|-----------|---------|
+| `initialize` | — | `admin: Address`, `usdc_token: Address` | — |
+| `deposit` | `depositor` | `depositor: Address`, `amount: i128` | — |
+| `disburse` | `admin` | `recipient: Address`, `amount: i128`, `proof_hash: BytesN<32>` | — |
+| `get_balance` | — | — | `i128` |
+| `get_stats` | — | — | `VaultStats` |
+| `get_admin` | — | — | `Address` |
+| `get_token` | — | — | `Address` |
+| `transfer_admin` | `admin` | `new_admin: Address` | — |
 
-| Function | Auth | Description |
-|----------|------|-------------|
-| `initialize(admin, usdc_token)` | — | One-time setup. Panics if called again. |
-| `deposit(depositor, amount)` | `depositor` | Transfer USDC into the vault. Amount is in stroops (1 USDC = 10,000,000). |
-| `disburse(recipient, amount, proof_hash)` | `admin` | Pay USDC to a recipient. `proof_hash` anchors the ZK justification on-chain. |
-| `get_balance()` | — | Live USDC balance held by the contract. |
-| `get_stats()` | — | Returns `{ vault_balance, total_raised, total_disbursed }`. |
-| `get_admin()` | — | Current admin address. |
-| `get_token()` | — | USDC token SAC address. |
-| `transfer_admin(new_admin)` | `admin` | Hand off admin rights. |
-
----
+`amount` is always in **stroops** (7 decimal places). 1 XLM = 10,000,000 stroops.
 
 ### `streaming`
 
-Real-time payment streams. Recipients accumulate USDC per second without any cron job — the live balance is computed on-chain from `accumulated + elapsed * flow_rate_per_second`.
+| Function | Auth | Parameters | Returns |
+|----------|------|-----------|---------|
+| `initialize` | — | `admin: Address`, `usdc_token: Address` | — |
+| `create_stream` | `admin` | `recipient: Address`, `flow_rate_per_second: i128`, `end_time: u64` | `u32` (stream ID) |
+| `toggle_stream` | `admin` | `stream_id: u32` | `StreamStatus` |
+| `get_accumulated` | — | `stream_id: u32` | `i128` |
+| `withdraw` | `recipient` | `stream_id: u32` | `i128` (amount paid) |
+| `get_stream` | — | `stream_id: u32` | `Stream` |
+| `get_all_streams` | — | — | `Vec<Stream>` |
+| `get_admin` | — | — | `Address` |
 
-| Function | Auth | Description |
-|----------|------|-------------|
-| `initialize(admin, usdc_token)` | — | One-time setup. |
-| `create_stream(recipient, flow_rate_per_second, end_time)` | `admin` | Create a stream. Fund the contract first — it validates you hold enough USDC. Returns `stream_id`. |
-| `toggle_stream(stream_id)` | `admin` | Pause ↔ Active. Snapshots `accumulated` on pause so no time is lost. |
-| `get_accumulated(stream_id)` | — | Live claimable balance (simulation call — no fee, no state change). |
-| `withdraw(stream_id)` | `recipient` | Recipient claims their accumulated USDC. Marks stream Completed if past `end_time`. |
-| `get_stream(stream_id)` | — | Returns full `Stream` record. |
-| `get_all_streams()` | — | Returns all streams. |
-| `get_admin()` | — | Current admin address. |
+**Flow rate formula:** `flow_rate_per_second = ceil(monthly_amount_stroops / 2_592_000)`
 
-**Flow rate conversion:**
+Example — 5,000 XLM per month:
 ```
-flow_rate_per_second = ceil(monthly_usdc_stroops / 2_592_000)
-# Example: 5,000 USDC/month
-flow_rate_per_second = ceil(50_000_000_000 / 2_592_000) = 19_291
+flow_rate = ceil(50_000_000_000 / 2_592_000) = 19_291 stroops/sec
 ```
-
----
 
 ### `proof_registry`
 
-On-chain ZK proof store. Every registered proof gets a sequential ID, a hash index for O(1) lookups, and a permanent ledger timestamp.
+| Function | Auth | Parameters | Returns |
+|----------|------|-----------|---------|
+| `initialize` | — | `admin: Address` | — |
+| `register_proof` | `submitter` | `submitter: Address`, `proof_hash: BytesN<32>`, `public_inputs_hash: BytesN<32>`, `proof_type: Symbol` | `u32` (proof ID) |
+| `get_proof` | — | `id: u32` | `ProofEntry` |
+| `get_all_proofs` | — | — | `Vec<ProofEntry>` |
+| `verify_proof_exists` | — | `proof_hash: BytesN<32>` | `bool` |
+| `get_id_by_hash` | — | `proof_hash: BytesN<32>` | `u32` |
+| `get_admin` | — | — | `Address` |
+| `transfer_admin` | `admin` | `new_admin: Address` | — |
 
-| Function | Auth | Description |
-|----------|------|-------------|
-| `initialize(admin)` | — | One-time setup. |
-| `register_proof(submitter, proof_hash, public_inputs_hash, proof_type)` | `submitter` | Anchor a Noir proof on-chain. `proof_type` is one of `payroll`, `operational`, `relief`. Panics on duplicate hash. Returns `proof_id`. |
-| `get_proof(id)` | — | Returns `ProofEntry` by sequential ID. |
-| `get_all_proofs()` | — | Returns all registered proofs. |
-| `verify_proof_exists(proof_hash)` | — | Returns `bool` — cheap existence check by hash. |
-| `get_id_by_hash(proof_hash)` | — | Returns the proof ID for a given hash. |
-| `get_admin()` | — | Current admin. |
-| `transfer_admin(new_admin)` | `admin` | Transfer admin rights. |
+`proof_type` is a Soroban `Symbol` (max 9 chars): `"payroll"`, `"operational"`, `"relief"`.
 
 ---
 
@@ -68,23 +141,22 @@ On-chain ZK proof store. Every registered proof gets a sequential ID, a hash ind
 
 | Tool | Install |
 |------|---------|
-| Rust + Cargo | `curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \| sh` |
-| wasm32 target | `rustup target add wasm32-unknown-unknown` |
-| Stellar CLI | `cargo install stellar-cli --features opt` |
-| Funded testnet account | `stellar keys generate --global mykey --network testnet` then fund via [Friendbot](https://friendbot.stellar.org) |
+| Rust (stable) | `curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \| sh` |
+| wasm32v1-none target | `rustup target add wasm32v1-none` |
+| Stellar CLI | Download binary from [releases](https://github.com/stellar/stellar-cli/releases/latest) or `cargo install stellar-cli` |
 
 ---
 
 ## Build
 
 ```bash
-# From the repo root
+# From repo root
 stellar contract build
 
-# WASM files are written to:
-# target/wasm32-unknown-unknown/release/treasury_vault.wasm
-# target/wasm32-unknown-unknown/release/streaming.wasm
-# target/wasm32-unknown-unknown/release/proof_registry.wasm
+# WASM output:
+# target/wasm32v1-none/release/treasury_vault.wasm
+# target/wasm32v1-none/release/streaming.wasm
+# target/wasm32v1-none/release/proof_registry.wasm
 ```
 
 ---
@@ -92,107 +164,84 @@ stellar contract build
 ## Test
 
 ```bash
-cargo test
+cargo test --workspace
 ```
 
-Tests run inside the Soroban test environment (no live network needed). The `streaming` and `proof_registry` contracts have embedded `#[cfg(test)]` suites covering:
-- Accumulated balance accrual math
-- Paused stream snapshots
-- Duplicate proof registration guards
-- Proof count increments
+Tests run in the Soroban in-process environment — no live network, no XLM needed. Covers:
+
+- `streaming`: accumulated balance accrual math, paused stream snapshot, flow-rate ceiling division
+- `proof_registry`: register & verify, duplicate hash panic, proof count increment
 
 ---
 
-## Deploy to Testnet
+## Deploy Your Own Testnet Instance
 
 ```bash
-cd contracts/
+# 1. Generate a new key
+stellar keys generate my-admin --network testnet
 
-# Set your admin address
-export ADMIN_ACCOUNT=G...YOUR_STELLAR_ADDRESS...
+# 2. Get the address
+stellar keys address my-admin
 
-# Make the script executable and run it
+# 3. Fund via Friendbot
+curl "https://friendbot.stellar.org?addr=$(stellar keys address my-admin)"
+
+# 4. Register your token as a CLI alias (use native XLM SAC or your own token)
+stellar contract id asset --asset native --network testnet
+stellar contract alias add xlm_sac --id <XLM_SAC_ID> --network testnet
+
+# 5. Deploy & initialize all 3 contracts
+export ADMIN_ACCOUNT=$(stellar keys address my-admin)
 chmod +x scripts/deploy-testnet.sh
 ./scripts/deploy-testnet.sh
+
+# 6. Copy the printed IDs into shieldfund-frontend/src/lib/contracts.ts
 ```
-
-The script will:
-1. Build all three WASM contracts
-2. Deploy each to Stellar testnet via the Soroban RPC
-3. Call `initialize` on each contract
-4. Print all three contract IDs
-
-**Copy the printed IDs into `src/lib/contracts.ts` in [shieldfund-frontend](https://github.com/Crowder-Stellar/shieldfund-frontend).**
 
 ---
 
 ## Interact via Stellar CLI
 
-After deploying, you can invoke contract functions directly from the terminal:
+Using the live testnet contracts:
 
 ```bash
-export NETWORK=testnet
-export VAULT_ID=C...       # from deploy output
-export STREAMING_ID=C...
-export REGISTRY_ID=C...
-export ADMIN=G...          # your key alias registered with stellar-cli
+VAULT=CAUWJPC73YLQMSV6X4QPLUVS2UZFE2PMRIQSSCDN62DNN6J76Y5RETIG
+STREAM=CDU7ZIVQ3UC4K3DHV3NMQGW5UMSYFCKCC6YJKHT4YLNEZJRWL6THE6WQ
+REGISTRY=CBDLHQQPKC5524CFWPD4HMPTZGWBYQNW3IKGAFH6IAYBU3F2F6AO2332
 
-# Check vault stats
-stellar contract invoke --id $VAULT_ID --network $NETWORK -- get_stats
+# Read vault stats (free simulation — no fee, no signing)
+stellar contract invoke --id $VAULT --source my-admin --network testnet \
+  -- get_stats
 
-# Deposit 10 USDC (= 100_000_000 stroops)
-stellar contract invoke \
-  --id $VAULT_ID \
-  --source $ADMIN \
-  --network $NETWORK \
+# Deposit 10 XLM (100,000,000 stroops)
+stellar contract invoke --id $VAULT --source my-admin --network testnet \
   -- deposit \
-  --depositor $ADMIN \
+  --depositor $(stellar keys address my-admin) \
   --amount 100000000
 
-# Disburse 5 USDC with a proof hash anchor
-stellar contract invoke \
-  --id $VAULT_ID \
-  --source $ADMIN \
-  --network $NETWORK \
-  -- disburse \
-  --recipient G...RECIPIENT... \
-  --amount 50000000 \
-  --proof_hash 0000000000000000000000000000000000000000000000000000000000000000
-
-# Create a stream: 1929 stroops/sec ≈ 5000 USDC/month, ending in 30 days
-stellar contract invoke \
-  --id $STREAMING_ID \
-  --source $ADMIN \
-  --network $NETWORK \
+# Create a stream: ~1 XLM/hour = 2778 stroops/sec, runs for 7 days
+stellar contract invoke --id $STREAM --source my-admin --network testnet \
   -- create_stream \
-  --recipient G...RECIPIENT... \
-  --flow_rate_per_second 1929 \
-  --end_time $(($(date +%s) + 2592000))
+  --recipient G...RECIPIENT_ADDRESS... \
+  --flow_rate_per_second 2778 \
+  --end_time $(($(date +%s) + 604800))
 
-# Check claimable balance for stream 0
-stellar contract invoke \
-  --id $STREAMING_ID \
-  --network $NETWORK \
-  -- get_accumulated \
-  --stream_id 0
+# Check live claimable balance for stream 0
+stellar contract invoke --id $STREAM --source my-admin --network testnet \
+  -- get_accumulated --stream_id 0
 
 # Register a ZK proof
-stellar contract invoke \
-  --id $REGISTRY_ID \
-  --source $ADMIN \
-  --network $NETWORK \
+stellar contract invoke --id $REGISTRY --source my-admin --network testnet \
   -- register_proof \
-  --submitter $ADMIN \
-  --proof_hash abcdef0000000000000000000000000000000000000000000000000000000000 \
-  --public_inputs_hash 1234560000000000000000000000000000000000000000000000000000000000 \
+  --submitter $(stellar keys address my-admin) \
+  --proof_hash abcdef1234567890abcdef1234567890abcdef1234567890abcdef1234567890 \
+  --public_inputs_hash 1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef \
   --proof_type payroll
 
-# Verify a proof exists by hash
-stellar contract invoke \
-  --id $REGISTRY_ID \
-  --network $NETWORK \
+# Check if a proof hash exists
+stellar contract invoke --id $REGISTRY --source my-admin --network testnet \
   -- verify_proof_exists \
-  --proof_hash abcdef0000000000000000000000000000000000000000000000000000000000
+  --proof_hash abcdef1234567890abcdef1234567890abcdef1234567890abcdef1234567890
 ```
 
 ---
@@ -201,29 +250,40 @@ stellar contract invoke \
 
 ```
 shieldfund-contracts/
-├── Cargo.toml                          # Workspace manifest — all members share soroban-sdk dep
-├── Cargo.lock                          # Pinned dependency tree
-├── .gitignore                          # Excludes target/ and .stellar/
+├── Cargo.toml                     # Workspace — all members share soroban-sdk = 22
+├── Cargo.lock
+├── .gitignore                     # Excludes target/, .stellar/, *.wasm
 │
 ├── treasury_vault/
 │   ├── Cargo.toml
-│   └── src/lib.rs                      # deposit, disburse, get_stats, transfer_admin
+│   └── src/lib.rs                 # deposit, disburse, get_stats, transfer_admin
 │
 ├── streaming/
 │   ├── Cargo.toml
-│   └── src/lib.rs                      # create_stream, toggle_stream, withdraw, get_accumulated
+│   └── src/lib.rs                 # create_stream, toggle_stream, withdraw, get_accumulated
+│                                  # includes #[cfg(test)] suite
 │
 ├── proof_registry/
 │   ├── Cargo.toml
-│   └── src/lib.rs                      # register_proof, verify_proof_exists, get_all_proofs
+│   └── src/lib.rs                 # register_proof, verify_proof_exists, get_all_proofs
+│                                  # includes #[cfg(test)] suite
 │
 └── scripts/
-    └── deploy-testnet.sh               # One-shot build + deploy + initialize for all 3 contracts
+    └── deploy-testnet.sh          # Build + deploy + initialize all 3 contracts in one shot
 ```
+
+---
+
+## CI
+
+GitHub Actions on every push and PR:
+- **`cargo test --workspace`** — runs the in-process test suites
+- **`stellar contract build`** — compiles all 3 WASMs (push to main only)
+- WASM artifacts uploaded for 7 days after each successful build
 
 ---
 
 ## Related Repos
 
-- [shieldfund-frontend](https://github.com/Crowder-Stellar/shieldfund-frontend) — React dashboard (paste contract IDs here after deploy)
+- [shieldfund-frontend](https://github.com/Crowder-Stellar/shieldfund-frontend) — React dashboard (paste contract IDs here)
 - [shieldfund-backend](https://github.com/Crowder-Stellar/shieldfund-backend) — Express API for off-chain indexing
