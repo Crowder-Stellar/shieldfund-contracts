@@ -55,11 +55,8 @@ jobs:
           key: ${{ runner.os }}-cargo-wasm-${{ hashFiles('**/Cargo.lock') }}
           restore-keys: ${{ runner.os }}-cargo-
 
-      - name: Install Stellar CLI
-        run: cargo install stellar-cli
-
       - name: Build all contracts
-        run: stellar contract build
+        run: cargo build --target wasm32-unknown-unknown --release
 
       - name: Upload WASM artifacts
         uses: actions/upload-artifact@v4
