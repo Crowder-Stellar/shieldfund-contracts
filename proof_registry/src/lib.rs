@@ -56,10 +56,12 @@ impl ProofRegistryContract {
     /// Register a ZK proof on-chain.
     ///
     /// Called by the proof backend after successfully generating and locally
-    /// verifying the Noir proof. Only the admin or pre-approved submitters
-    /// should call this in production — for hackathon the admin submits.
+    /// verifying the Noir proof. Restricted to the admin so a random address
+    /// can't anchor an unverified hash into the registry that
+    /// treasury_vault::disburse() would then trust.
     ///
-    /// Panics if the same `proof_hash` is registered twice.
+    /// Panics if `submitter` is not the admin, or if the same `proof_hash` is
+    /// registered twice.
     pub fn register_proof(
         env: Env,
         submitter: Address,
@@ -68,6 +70,9 @@ impl ProofRegistryContract {
         proof_type: Symbol,
     ) -> u32 {
         submitter.require_auth();
+
+        let admin: Address = env.storage().instance().get(&DataKey::Admin).unwrap();
+        assert!(submitter == admin, "only admin may submit proofs");
 
         // Guard against duplicate registrations.
         assert!(
@@ -228,6 +233,21 @@ mod tests {
         client.register_proof(&admin, &hash, &inputs, &pt);
         // Second call with same hash must panic
         client.register_proof(&admin, &hash, &inputs, &pt);
+    }
+
+    #[test]
+    #[should_panic(expected = "only admin may submit proofs")]
+    fn non_admin_submitter_panics() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (client, _admin) = deploy(&env);
+
+        let outsider = Address::generate(&env);
+        let hash = zero_hash(&env);
+        let inputs = one_hash(&env);
+        let pt = Symbol::new(&env, "payroll");
+
+        client.register_proof(&outsider, &hash, &inputs, &pt);
     }
 
     #[test]
