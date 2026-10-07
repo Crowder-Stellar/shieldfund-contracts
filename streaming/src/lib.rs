@@ -78,6 +78,7 @@ impl StreamingContract {
         env.storage().persistent().set(&DataKey::StreamCount, &0u32);
         bump_instance(&env);
         bump(&env, &DataKey::StreamCount);
+        env.events().publish((symbol_short!("init"), admin), usdc_token);
     }
 
     /// Admin creates a new payment stream.
@@ -189,7 +190,7 @@ impl StreamingContract {
         bump(&env, &DataKey::Stream(stream_id));
 
         env.events()
-            .publish((symbol_short!("s_toggle"), stream_id), ());
+            .publish((symbol_short!("s_toggle"), stream_id), new_status.clone());
 
         new_status
     }
@@ -268,8 +269,10 @@ impl StreamingContract {
             .set(&DataKey::Stream(stream_id), &stream);
         bump(&env, &DataKey::Stream(stream_id));
 
-        env.events()
-            .publish((symbol_short!("s_wdraw"), stream_id), payout);
+        env.events().publish(
+            (symbol_short!("s_wdraw"), stream_id),
+            (stream.recipient.clone(), payout, stream.status.clone()),
+        );
 
         payout
     }
@@ -367,9 +370,9 @@ impl StreamingContract {
 mod tests {
     use super::*;
     use soroban_sdk::{
-        testutils::{storage::{Instance as _, Persistent as _}, Address as _, Ledger},
+        testutils::{storage::{Instance as _, Persistent as _}, Address as _, Events as _, Ledger},
         token::StellarAssetClient,
-        vec, Env, IntoVal, Symbol,
+        vec, Env, FromVal, IntoVal, Symbol,
     };
 
     fn setup_env() -> Env {
@@ -470,6 +473,27 @@ mod tests {
         assert_eq!(client.get_pending_admin(), None);
         assert!(client.try_accept_admin().is_err());
         assert_eq!(client.get_admin(), admin);
+    }
+
+    #[test]
+    fn toggle_and_withdraw_events_carry_state() {
+        let env = setup_env();
+        env.ledger().with_mut(|l| l.timestamp = 1_000);
+        let (client, _) = deploy(&env);
+        let recipient = Address::generate(&env);
+        client.create_stream(&recipient, &10, &2_000);
+
+        env.ledger().with_mut(|l| l.timestamp = 1_100);
+        client.toggle_stream(&0);
+        let (_, topics, data) = env.events().all().last().unwrap();
+        assert_eq!(topics, vec![&env, symbol_short!("s_toggle").into_val(&env), 0u32.into_val(&env)]);
+        assert_eq!(StreamStatus::from_val(&env, &data), StreamStatus::Paused);
+
+        client.withdraw(&0);
+        let (_, topics, data) = env.events().all().last().unwrap();
+        assert_eq!(topics, vec![&env, symbol_short!("s_wdraw").into_val(&env), 0u32.into_val(&env)]);
+        let (who, paid, status): (Address, i128, StreamStatus) = data.into_val(&env);
+        assert_eq!((who, paid, status), (recipient, 1_000, StreamStatus::Paused));
     }
 
     #[test]

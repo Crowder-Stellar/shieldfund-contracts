@@ -71,6 +71,7 @@ impl ProofRegistryContract {
         env.storage().persistent().set(&DataKey::ProofCount, &0u32);
         bump_instance(&env);
         bump(&env, &DataKey::ProofCount);
+        env.events().publish((symbol_short!("init"),), admin);
     }
 
     /// Register a ZK proof on-chain.
@@ -260,8 +261,8 @@ impl ProofRegistryContract {
 mod tests {
     use super::*;
     use soroban_sdk::{
-        testutils::{storage::{Instance as _, Persistent as _}, Address as _, Ledger},
-        BytesN, Env, IntoVal, Symbol,
+        testutils::{storage::{Instance as _, Persistent as _}, Address as _, Events as _, Ledger},
+        BytesN, Env, FromVal, IntoVal, Symbol,
     };
 
     fn deploy(env: &Env) -> (ProofRegistryContractClient<'_>, Address) {
@@ -481,6 +482,39 @@ mod tests {
         let pt = Symbol::new(&env, "payroll");
         assert!(client.try_register_proof(&admin, &one_hash(&env), &zero_hash(&env), &pt).is_err());
         client.register_proof(&nominee, &one_hash(&env), &zero_hash(&env), &pt);
+    }
+
+    #[test]
+    fn registering_a_proof_emits_p_reg() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (client, admin) = deploy(&env);
+        let pt = Symbol::new(&env, "payroll");
+        client.register_proof(&admin, &one_hash(&env), &zero_hash(&env), &pt);
+
+        let (contract, topics, data) = env.events().all().last().unwrap();
+        assert_eq!(contract, client.address);
+        assert_eq!(topics, soroban_sdk::vec![&env, symbol_short!("p_reg").into_val(&env), admin.into_val(&env)]);
+        let (id, hash, ty): (u32, BytesN<32>, Symbol) = data.into_val(&env);
+        assert_eq!((id, hash, ty), (0, one_hash(&env), pt));
+    }
+
+    #[test]
+    fn admin_handover_emits_events() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (client, admin) = deploy(&env);
+        let nominee = Address::generate(&env);
+
+        client.propose_admin(&nominee);
+        let (_, topics, data) = env.events().all().last().unwrap();
+        assert_eq!(topics, soroban_sdk::vec![&env, symbol_short!("adm_prop").into_val(&env), admin.into_val(&env)]);
+        assert_eq!(Address::from_val(&env, &data), nominee);
+
+        client.accept_admin();
+        let (_, topics, data) = env.events().all().last().unwrap();
+        assert_eq!(topics, soroban_sdk::vec![&env, symbol_short!("adm_acc").into_val(&env), admin.into_val(&env)]);
+        assert_eq!(Address::from_val(&env, &data), nominee);
     }
 
     #[test]
