@@ -9,6 +9,7 @@ use soroban_sdk::{
 #[contracttype]
 enum DataKey {
     Admin,
+    PendingAdmin,
     Token,
     StreamCount,
     Stream(u32),
@@ -305,6 +306,50 @@ impl StreamingContract {
         env.storage().instance().get(&DataKey::Admin).unwrap()
     }
 
+    /// Step 1 of an admin handover: the current admin nominates a successor.
+    /// Nothing changes until the successor accepts, so a typo can't hand the
+    /// contract to an address nobody controls. A new proposal replaces any
+    /// pending one.
+    pub fn propose_admin(env: Env, new_admin: Address) {
+        let admin: Address = env.storage().instance().get(&DataKey::Admin).unwrap();
+        admin.require_auth();
+        bump_instance(&env);
+        env.storage().instance().set(&DataKey::PendingAdmin, &new_admin);
+        env.events().publish((symbol_short!("adm_prop"), admin), new_admin);
+    }
+
+    /// Step 2: the nominated address accepts and becomes admin.
+    pub fn accept_admin(env: Env) {
+        let pending: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::PendingAdmin)
+            .expect("no pending admin");
+        pending.require_auth();
+        bump_instance(&env);
+        let old: Address = env.storage().instance().get(&DataKey::Admin).unwrap();
+        env.storage().instance().set(&DataKey::Admin, &pending);
+        env.storage().instance().remove(&DataKey::PendingAdmin);
+        env.events().publish((symbol_short!("adm_acc"), old), pending);
+    }
+
+    /// The current admin withdraws a pending proposal.
+    pub fn cancel_admin_transfer(env: Env) {
+        let admin: Address = env.storage().instance().get(&DataKey::Admin).unwrap();
+        admin.require_auth();
+        bump_instance(&env);
+        assert!(
+            env.storage().instance().has(&DataKey::PendingAdmin),
+            "no pending admin"
+        );
+        env.storage().instance().remove(&DataKey::PendingAdmin);
+        env.events().publish((symbol_short!("adm_cncl"), admin), ());
+    }
+
+    pub fn get_pending_admin(env: Env) -> Option<Address> {
+        env.storage().instance().get(&DataKey::PendingAdmin)
+    }
+
     /// Keeps a stream (and the contract instance) alive. Anyone may call
     /// this; it only extends TTLs, it changes no data.
     pub fn extend_ttl(env: Env, stream_id: u32) {
@@ -367,6 +412,64 @@ mod tests {
         let env = setup_env();
         let (client, _) = deploy(&env);
         client.extend_ttl(&7);
+    }
+
+
+    #[test]
+    fn admin_handover_takes_two_steps() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (client, admin) = deploy(&env);
+        let nominee = Address::generate(&env);
+
+        client.propose_admin(&nominee);
+        assert_eq!(env.auths()[0].0, admin);
+        assert_eq!(client.get_admin(), admin);
+        assert_eq!(client.get_pending_admin(), Some(nominee.clone()));
+
+        client.accept_admin();
+        assert_eq!(env.auths()[0].0, nominee);
+        assert_eq!(client.get_admin(), nominee);
+        assert_eq!(client.get_pending_admin(), None);
+    }
+
+    #[test]
+    fn only_the_admin_can_propose_and_only_the_nominee_can_accept() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (client, admin) = deploy(&env);
+        let nominee = Address::generate(&env);
+
+        env.set_auths(&[]);
+        assert!(client.try_propose_admin(&nominee).is_err());
+
+        env.mock_all_auths();
+        client.propose_admin(&nominee);
+        env.set_auths(&[]);
+        assert!(client.try_accept_admin().is_err());
+        assert_eq!(client.get_admin(), admin);
+    }
+
+    #[test]
+    #[should_panic(expected = "no pending admin")]
+    fn accept_without_a_proposal_panics() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (client, admin) = deploy(&env);
+        let _ = admin;
+        client.accept_admin();
+    }
+
+    #[test]
+    fn cancelling_a_proposal_blocks_acceptance() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (client, admin) = deploy(&env);
+        client.propose_admin(&Address::generate(&env));
+        client.cancel_admin_transfer();
+        assert_eq!(client.get_pending_admin(), None);
+        assert!(client.try_accept_admin().is_err());
+        assert_eq!(client.get_admin(), admin);
     }
 
     #[test]
