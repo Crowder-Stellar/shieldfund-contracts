@@ -46,11 +46,12 @@ shieldfund-contracts (Cargo workspace)
 ├── streaming               ← Real-time payment engine
 │   ├── __constructor()     runs at deploy: sets admin + token SAC
 │   ├── create_stream()     creates Stream record (auth: admin)
-│   │                       validates contract holds enough tokens first
+│   │                       reserves its full total from uncommitted balance
 │   ├── toggle_stream()     Active ↔ Paused, snapshots accumulated (auth: admin)
 │   ├── get_accumulated()   simulation call: accumulated + elapsed × rate
 │   ├── withdraw()          recipient claims tokens (auth: recipient)
 │   ├── get_stream()        read single Stream record
+│   ├── get_committed() / get_available() / get_reserved()   funding status
 │   ├── get_stream_count() / get_streams(start, limit)   paginated reads
 │   ├── get_all_streams()   deprecated — unbounded
 │   ├── get_admin()
@@ -131,6 +132,9 @@ streaming contract
 | `get_accumulated` | — | `stream_id: u32` | `i128` |
 | `withdraw` | `recipient` | `stream_id: u32` | `i128` (amount paid) |
 | `get_stream` | — | `stream_id: u32` | `Stream` |
+| `get_committed` | — | — | `i128` (reserved for open streams) |
+| `get_available` | — | — | `i128` (balance − committed) |
+| `get_reserved` | — | `stream_id: u32` | `i128` (unpaid reservation) |
 | `get_stream_count` | — | — | `u32` |
 | `get_streams` | — | `start: u32`, `limit: u32` (1–50) | `Vec<Stream>` |
 | `get_all_streams` | — | — | `Vec<Stream>` (deprecated) |
@@ -139,6 +143,11 @@ streaming contract
 | `accept_admin` | nominee | — | — |
 | `cancel_admin_transfer` | `admin` | — | — |
 | `get_pending_admin` | — | — | `Option<Address>` |
+
+**Funding:** `create_stream` reserves `flow_rate × (end_time − now)` and only succeeds if `get_available()`
+covers it, so two streams can never be promised the same tokens. Payouts release their share of the
+reservation; when a stream completes, the unaccrued remainder (e.g. paused time) is released too. A stream
+paused through its end can be closed with a zero-payout `withdraw` after `end_time`.
 
 **Flow rate formula:** `flow_rate_per_second = ceil(monthly_amount_stroops / 2_592_000)`
 

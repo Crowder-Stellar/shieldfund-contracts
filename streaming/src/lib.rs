@@ -14,6 +14,11 @@ enum DataKey {
     Token,
     StreamCount,
     Stream(u32),
+    // Sum of every open stream's unpaid reservation (stroops). New streams
+    // can only be funded from `balance - Committed`.
+    Committed,
+    // Per-stream unpaid reservation: funded total minus payouts so far.
+    Reserved(u32),
 }
 
 // ── Errors ────────────────────────────────────────────────────────────────────
@@ -27,7 +32,7 @@ pub enum Error {
     InvalidFlowRate = 1,
     /// `end_time` is not in the future.
     InvalidEndTime = 2,
-    /// The contract doesn't hold enough tokens to fund the full stream.
+    /// The contract's uncommitted balance can't fund the full stream.
     InsufficientBalance = 3,
     /// No stream with this id.
     StreamNotFound = 4,
@@ -81,6 +86,32 @@ fn admin(env: &Env) -> Address {
     env.storage().instance().get(&DataKey::Admin).unwrap()
 }
 
+fn committed(env: &Env) -> i128 {
+    env.storage().persistent().get(&DataKey::Committed).unwrap_or(0)
+}
+
+fn reserved(env: &Env, stream_id: u32) -> i128 {
+    env.storage().persistent().get(&DataKey::Reserved(stream_id)).unwrap_or(0)
+}
+
+fn token_balance(env: &Env) -> i128 {
+    let token_addr: Address = env.storage().instance().get(&DataKey::Token).unwrap();
+    token::Client::new(env, &token_addr).balance(&env.current_contract_address())
+}
+
+/// Releases `amount` of `stream_id`'s reservation (after a payout, or the
+/// unspent remainder when the stream completes).
+fn release(env: &Env, stream_id: u32, amount: i128) {
+    let left = reserved(env, stream_id).saturating_sub(amount).max(0);
+    if left == 0 {
+        env.storage().persistent().remove(&DataKey::Reserved(stream_id));
+    } else {
+        env.storage().persistent().set(&DataKey::Reserved(stream_id), &left);
+    }
+    let total = committed(env).saturating_sub(amount).max(0);
+    env.storage().persistent().set(&DataKey::Committed, &total);
+}
+
 fn load_stream(env: &Env, stream_id: u32) -> Result<Stream, Error> {
     env.storage()
         .persistent()
@@ -127,8 +158,11 @@ impl StreamingContract {
     ///
     /// `end_time`: Unix timestamp when the stream ends.
     ///
-    /// The streaming contract must hold enough USDC to cover the full
-    /// stream period. Fund it via a direct token transfer before calling this.
+    /// The streaming contract must hold enough *uncommitted* USDC to cover
+    /// the full stream period — tokens already reserved for other open
+    /// streams don't count (see `get_available`). Fund it via a direct token
+    /// transfer before calling this. The full amount is reserved until it is
+    /// paid out or the stream completes.
     ///
     /// Errors: `InvalidFlowRate`, `InvalidEndTime`, `Overflow`, `InsufficientBalance`.
     /// Event: `("s_create", recipient)` → `(id, flow_rate_per_second, end_time)`.
@@ -148,17 +182,19 @@ impl StreamingContract {
             return Err(Error::InvalidEndTime);
         }
 
-        // Verify the contract holds enough USDC for this stream.
+        // Verify the contract holds enough unreserved USDC for this stream.
         let total_needed = flow_rate_per_second
             .checked_mul((end_time - now) as i128)
             .ok_or(Error::Overflow)?;
-        let token_addr: Address = env.storage().instance().get(&DataKey::Token).unwrap();
-        let contract_balance = token::Client::new(&env, &token_addr).balance(&env.current_contract_address());
-        if contract_balance < total_needed {
+        let committed_now = committed(&env);
+        if token_balance(&env).saturating_sub(committed_now) < total_needed {
             return Err(Error::InsufficientBalance);
         }
+        let new_committed = committed_now.checked_add(total_needed).ok_or(Error::Overflow)?;
 
         let id = Self::get_stream_count(env.clone());
+        env.storage().persistent().set(&DataKey::Committed, &new_committed);
+        env.storage().persistent().set(&DataKey::Reserved(id), &total_needed);
 
         let stream = Stream {
             id,
@@ -235,33 +271,45 @@ impl StreamingContract {
 
     /// Recipient withdraws their accumulated USDC.
     ///
-    /// Marks the stream as Completed once `end_time` has passed.
+    /// Marks the stream as Completed once `end_time` has passed and releases
+    /// whatever was reserved but never accrued (e.g. paused time). After
+    /// `end_time` this succeeds with a payout of 0 if nothing is owed, so a
+    /// stream paused through its end can still be closed.
     ///
-    /// Errors: `StreamNotFound`, `NothingToWithdraw`, `Overflow`.
+    /// Errors: `StreamNotFound`, `StreamCompleted`, `NothingToWithdraw`, `Overflow`.
     /// Events: `("s_wdraw", stream_id)` → `(recipient, payout)`, then
     /// `("s_done", stream_id)` → `recipient` if the stream just completed.
     pub fn withdraw(env: Env, stream_id: u32) -> Result<i128, Error> {
         let mut stream = load_stream(&env, stream_id)?;
         stream.recipient.require_auth();
 
+        if stream.status == StreamStatus::Completed {
+            return Err(Error::StreamCompleted);
+        }
+
         let now = env.ledger().timestamp();
         let payout = owed(&stream, now)?;
-        if payout <= 0 {
+        let completed = now >= stream.end_time;
+        if payout <= 0 && !completed {
             return Err(Error::NothingToWithdraw);
         }
 
-        let token_addr: Address = env.storage().instance().get(&DataKey::Token).unwrap();
-        token::Client::new(&env, &token_addr).transfer(
-            &env.current_contract_address(),
-            &stream.recipient,
-            &payout,
-        );
+        if payout > 0 {
+            let token_addr: Address = env.storage().instance().get(&DataKey::Token).unwrap();
+            token::Client::new(&env, &token_addr).transfer(
+                &env.current_contract_address(),
+                &stream.recipient,
+                &payout,
+            );
+            release(&env, stream_id, payout);
+        }
 
         stream.accumulated = 0;
         stream.last_update = now;
-        let completed = now >= stream.end_time;
         if completed {
             stream.status = StreamStatus::Completed;
+            // Free whatever was reserved but never accrued (paused time).
+            release(&env, stream_id, reserved(&env, stream_id));
         }
 
         env.storage()
@@ -276,6 +324,22 @@ impl StreamingContract {
         }
 
         Ok(payout)
+    }
+
+    /// Tokens reserved for open streams (funded totals minus payouts).
+    pub fn get_committed(env: Env) -> i128 {
+        committed(&env)
+    }
+
+    /// Contract balance not reserved by any open stream — the most a new
+    /// stream can be funded with.
+    pub fn get_available(env: Env) -> i128 {
+        token_balance(&env).saturating_sub(committed(&env)).max(0)
+    }
+
+    /// Unpaid reservation still held for one stream.
+    pub fn get_reserved(env: Env, stream_id: u32) -> i128 {
+        reserved(&env, stream_id)
     }
 
     /// Returns the stored Stream record for a given ID.
@@ -614,7 +678,7 @@ mod tests {
         at(&env, T0 + DURATION + 5);
         setup.client.withdraw(&id);
         at(&env, T0 + DURATION + 50);
-        assert_eq!(setup.client.try_withdraw(&id), Err(Ok(Error::NothingToWithdraw)));
+        assert_eq!(setup.client.try_withdraw(&id), Err(Ok(Error::StreamCompleted)));
         assert_eq!(setup.client.try_toggle_stream(&id), Err(Ok(Error::StreamCompleted)));
     }
 
@@ -683,6 +747,98 @@ mod tests {
         assert_eq!(setup.client.withdraw(&id), 40 * RATE);
         assert_eq!(setup.token.balance(&recipient), 40 * RATE);
         assert_eq!(setup.client.get_stream(&id).status, StreamStatus::Completed);
+    }
+
+    // ── Committed funds (no over-commitment) ──────────────────────────────────
+
+    #[test]
+    fn second_stream_cannot_reuse_reserved_funds() {
+        let env = Env::default();
+        let (setup, _, id) = funded_stream(&env);
+        let full = RATE * DURATION as i128;
+        assert_eq!(setup.client.get_committed(), full);
+        assert_eq!(setup.client.get_reserved(&id), full);
+        assert_eq!(setup.client.get_available(), 0);
+
+        // Regression: this used to succeed against the same tokens, leaving
+        // the first recipient unable to withdraw later.
+        let other = Address::generate(&env);
+        assert_eq!(
+            setup.client.try_create_stream(&other, &RATE, &(T0 + DURATION)),
+            Err(Ok(Error::InsufficientBalance)),
+        );
+
+        setup.token_admin.mint(&setup.client.address, &full);
+        assert_eq!(setup.client.get_available(), full);
+        setup.client.create_stream(&other, &RATE, &(T0 + DURATION));
+        assert_eq!(setup.client.get_committed(), 2 * full);
+    }
+
+    #[test]
+    fn every_stream_can_be_paid_in_full() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let setup = deploy(&env);
+        let full = RATE * DURATION as i128;
+        setup.token_admin.mint(&setup.client.address, &(2 * full));
+        let a = Address::generate(&env);
+        let b = Address::generate(&env);
+        let sa = setup.client.create_stream(&a, &RATE, &(T0 + DURATION));
+        let sb = setup.client.create_stream(&b, &RATE, &(T0 + DURATION));
+
+        at(&env, T0 + DURATION);
+        assert_eq!(setup.client.withdraw(&sa), full);
+        assert_eq!(setup.client.withdraw(&sb), full);
+        assert_eq!(setup.client.get_committed(), 0);
+        assert_eq!(setup.token.balance(&setup.client.address), 0);
+    }
+
+    #[test]
+    fn payouts_release_their_reservation() {
+        let env = Env::default();
+        let (setup, _, id) = funded_stream(&env);
+        let full = RATE * DURATION as i128;
+
+        at(&env, T0 + 30);
+        setup.client.withdraw(&id);
+        assert_eq!(setup.client.get_reserved(&id), full - 30 * RATE);
+        assert_eq!(setup.client.get_committed(), full - 30 * RATE);
+        // Paid-out tokens left the contract, so nothing new became available.
+        assert_eq!(setup.client.get_available(), 0);
+    }
+
+    #[test]
+    fn completion_releases_unaccrued_paused_time() {
+        let env = Env::default();
+        let (setup, _, id) = funded_stream(&env);
+        let full = RATE * DURATION as i128;
+
+        at(&env, T0 + 40);
+        setup.client.toggle_stream(&id); // pause; 60s of reservation will never accrue
+        at(&env, T0 + DURATION + 1);
+        assert_eq!(setup.client.withdraw(&id), 40 * RATE);
+
+        assert_eq!(setup.client.get_stream(&id).status, StreamStatus::Completed);
+        assert_eq!(setup.client.get_reserved(&id), 0);
+        assert_eq!(setup.client.get_committed(), 0);
+        assert_eq!(setup.client.get_available(), full - 40 * RATE);
+    }
+
+    #[test]
+    fn stream_paused_through_its_end_can_be_closed_with_zero_payout() {
+        let env = Env::default();
+        let (setup, recipient, id) = funded_stream(&env);
+
+        setup.client.toggle_stream(&id); // paused immediately, nothing ever accrues
+        at(&env, T0 + DURATION - 1);
+        assert_eq!(setup.client.try_withdraw(&id), Err(Ok(Error::NothingToWithdraw)));
+
+        at(&env, T0 + DURATION);
+        assert_eq!(setup.client.withdraw(&id), 0);
+        assert_eq!(setup.token.balance(&recipient), 0);
+        assert_eq!(setup.client.get_stream(&id).status, StreamStatus::Completed);
+        assert_eq!(setup.client.get_committed(), 0);
+        assert_eq!(setup.client.get_available(), RATE * DURATION as i128);
     }
 
     #[test]

@@ -40,16 +40,18 @@ public-input order. Test vectors are in `treasury_vault` → `hashing_matches_pr
 5. `withdraw` pays the recipient at most `flow_rate × (end_time − start_time)` over the stream's life.
 6. Only the current admin can change the admin, and only the nominee can complete the change.
 7. Every state change emits an event (see README → Events).
+8. `get_committed()` never exceeds the token balance, so every open stream can be paid in full.
 
 ## Known issues and open questions
 
 These are deliberately not fixed in this PR. They're listed so the reviewer can weigh in.
 
-1. **Streams can over-commit funds.** `create_stream` checks the contract balance against the new stream
-   only, not against obligations to existing streams. Two streams can be created against the same funds,
-   and later withdrawals then fail at the token transfer. A fix needs a tracked committed-liability total.
-2. **Paused time strands funds.** Pausing keeps `end_time` fixed, so the share reserved for paused seconds
-   is never paid out. There is no admin function to reclaim unallocated or stranded tokens from `streaming`.
+1. ~~**Streams can over-commit funds.**~~ Fixed: `create_stream` reserves each stream's total against
+   `balance − committed`; payouts and completion release the reservation.
+2. **No reclaim of unreserved funds.** Reservations for paused time are released when a stream completes,
+   so they can fund new streams, but there is still no admin function to withdraw uncommitted tokens from
+   `streaming`. Closing a stream that is paused through its end needs the recipient's `withdraw` (zero
+   payout after `end_time`).
 3. **No storage TTL management.** Persistent entries (proofs, streams, spent-proof markers, totals) are
    never `extend_ttl`'d. Archived entries need restoring before they can be read. An archived `SpentProof`
    marker is restored, not lost, so it can't be bypassed, but this should be confirmed.
