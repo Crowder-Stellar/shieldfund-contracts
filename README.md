@@ -38,7 +38,7 @@ shieldfund-contracts (Cargo workspace)
 │   ├── get_stats()         read-only: { vault_balance, total_raised, total_disbursed }
 │   ├── get_admin()
 │   ├── get_token()
-│   └── transfer_admin()    (auth: current admin)
+│   └── propose_admin() → accept_admin()   two-step admin handover
 │
 ├── streaming               ← Real-time payment engine
 │   ├── __constructor()     runs at deploy: sets admin + token SAC
@@ -61,7 +61,7 @@ shieldfund-contracts (Cargo workspace)
     ├── get_id_by_hash()    reverse lookup: hash → id
     ├── get_proof_by_hash() full ProofEntry by hash
     ├── get_admin()
-    └── transfer_admin()    (auth: current admin)
+    └── propose_admin() → accept_admin()   two-step admin handover
 ```
 
 ### How the contracts interact
@@ -103,7 +103,10 @@ streaming contract
 | `get_stats` | — | — | `VaultStats` |
 | `get_admin` | — | — | `Address` |
 | `get_token` | — | — | `Address` |
-| `transfer_admin` | `admin` | `new_admin: Address` | — |
+| `propose_admin` | `admin` | `new_admin: Address` | — |
+| `accept_admin` | nominee | — | — |
+| `cancel_admin_transfer` | `admin` | — | — |
+| `get_pending_admin` | — | — | `Option<Address>` |
 
 `amount` is always in **stroops** (7 decimal places). 1 XLM = 10,000,000 stroops.
 
@@ -119,6 +122,10 @@ streaming contract
 | `get_stream` | — | `stream_id: u32` | `Stream` |
 | `get_all_streams` | — | — | `Vec<Stream>` |
 | `get_admin` | — | — | `Address` |
+| `propose_admin` | `admin` | `new_admin: Address` | — |
+| `accept_admin` | nominee | — | — |
+| `cancel_admin_transfer` | `admin` | — | — |
+| `get_pending_admin` | — | — | `Option<Address>` |
 | `extend_ttl` | — | `stream_id: u32` | — |
 
 **Flow rate formula:** `flow_rate_per_second = ceil(monthly_amount_stroops / 2_592_000)`
@@ -141,7 +148,10 @@ flow_rate = ceil(50_000_000_000 / 2_592_000) = 19_291 stroops/sec
 | `get_proof_by_hash` | — | `proof_hash: BytesN<32>` | `ProofEntry` |
 | `extend_ttl` | — | `id: u32` | — |
 | `get_admin` | — | — | `Address` |
-| `transfer_admin` | `admin` | `new_admin: Address` | — |
+| `propose_admin` | `admin` | `new_admin: Address` | — |
+| `accept_admin` | nominee | — | — |
+| `cancel_admin_transfer` | `admin` | — | — |
+| `get_pending_admin` | — | — | `Option<Address>` |
 
 `proof_type` is a Soroban `Symbol` (max 9 chars): `"payroll"`, `"operational"`, `"relief"`.
 
@@ -303,7 +313,7 @@ shieldfund-contracts/
 │
 ├── treasury_vault/
 │   ├── Cargo.toml
-│   └── src/lib.rs                 # deposit, disburse, get_stats, transfer_admin
+│   └── src/lib.rs                 # deposit, disburse, get_stats, admin handover
 │
 ├── streaming/
 │   ├── Cargo.toml
