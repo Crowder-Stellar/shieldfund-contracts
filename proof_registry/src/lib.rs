@@ -45,10 +45,9 @@ pub struct ProofRegistryContract;
 
 #[contractimpl]
 impl ProofRegistryContract {
-    pub fn initialize(env: Env, admin: Address) {
-        if env.storage().instance().has(&DataKey::Admin) {
-            panic!("already initialized");
-        }
+    /// Runs once, atomically with deployment, so there is no window in which
+    /// someone else could claim the admin role on an uninitialised contract.
+    pub fn __constructor(env: Env, admin: Address) {
         env.storage().instance().set(&DataKey::Admin, &admin);
         env.storage().persistent().set(&DataKey::ProofCount, &0u32);
     }
@@ -160,6 +159,14 @@ impl ProofRegistryContract {
             .expect("proof not found")
     }
 
+    /// Returns the full entry for a given proof hash, or panics if not found.
+    /// treasury_vault::disburse() uses this to check the registered
+    /// public_inputs_hash and proof_type against the payment it's making.
+    pub fn get_proof_by_hash(env: Env, proof_hash: BytesN<32>) -> ProofEntry {
+        let id = Self::get_id_by_hash(env.clone(), proof_hash);
+        Self::get_proof(env, id)
+    }
+
     pub fn get_admin(env: Env) -> Address {
         env.storage().instance().get(&DataKey::Admin).unwrap()
     }
@@ -176,14 +183,13 @@ mod tests {
     use super::*;
     use soroban_sdk::{
         testutils::Address as _,
-        BytesN, Env, Symbol,
+        BytesN, Env, IntoVal, Symbol,
     };
 
     fn deploy(env: &Env) -> (ProofRegistryContractClient<'_>, Address) {
         let admin = Address::generate(env);
-        let contract_id = env.register(ProofRegistryContract, ());
+        let contract_id = env.register(ProofRegistryContract, (admin.clone(),));
         let client = ProofRegistryContractClient::new(env, &contract_id);
-        client.initialize(&admin);
         (client, admin)
     }
 
@@ -263,5 +269,49 @@ mod tests {
         assert_eq!(id0, 0);
         assert_eq!(id1, 1);
         assert_eq!(client.get_all_proofs().len(), 2);
+    }
+
+    #[test]
+    fn constructor_sets_admin() {
+        let env = Env::default();
+        let (client, admin) = deploy(&env);
+        assert_eq!(client.get_admin(), admin);
+    }
+
+    #[test]
+    fn there_is_no_initialize_entrypoint_to_front_run() {
+        let env = Env::default();
+        let (client, _) = deploy(&env);
+        let attacker = Address::generate(&env);
+        let res = env.try_invoke_contract::<(), soroban_sdk::Error>(
+            &client.address,
+            &Symbol::new(&env, "initialize"),
+            soroban_sdk::vec![&env, attacker.into_val(&env)],
+        );
+        assert!(res.is_err());
+    }
+
+    #[test]
+    fn get_proof_by_hash_returns_registered_entry() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (client, admin) = deploy(&env);
+
+        let pt = Symbol::new(&env, "relief");
+        client.register_proof(&admin, &zero_hash(&env), &zero_hash(&env), &pt);
+        client.register_proof(&admin, &one_hash(&env), &zero_hash(&env), &pt);
+
+        let entry = client.get_proof_by_hash(&one_hash(&env));
+        assert_eq!(entry.id, 1);
+        assert_eq!(entry.proof_hash, one_hash(&env));
+        assert_eq!(entry.proof_type, pt);
+    }
+
+    #[test]
+    #[should_panic(expected = "proof not found")]
+    fn get_proof_by_hash_unknown_panics() {
+        let env = Env::default();
+        let (client, _) = deploy(&env);
+        client.get_proof_by_hash(&one_hash(&env));
     }
 }

@@ -1,38 +1,42 @@
 #!/usr/bin/env bash
 # ─────────────────────────────────────────────────────────────────────────────
-# ShieldFund — Soroban testnet deploy script
+# ShieldFund — Soroban deploy script
 #
 # Prerequisites:
 #   • Stellar CLI installed:  cargo install stellar-cli --features opt
-#   • Rust + wasm32 target:   rustup target add wasm32-unknown-unknown
-#   • A funded testnet account in the Stellar CLI keystore
+#   • Rust + wasm32v1-none target:  rustup target add wasm32v1-none
+#   • A funded account in the Stellar CLI keystore (e.g. `stellar keys generate admin --fund`)
 #
 # Usage:
-#   cd contracts/
-#   chmod +x scripts/deploy-testnet.sh
-#   ADMIN_ACCOUNT=<your-stellar-address> ./scripts/deploy-testnet.sh
+#   ADMIN_ACCOUNT=<key name or G... address> ./scripts/deploy-testnet.sh
 #
-# After successful deploy this script prints the contract IDs.
-# Copy them into ../src/lib/contracts.ts → CONTRACT_IDS.TESTNET.
+# Optional:
+#   NETWORK=local USDC_TOKEN=<C... token id> ./scripts/deploy-testnet.sh
+#   (NETWORK defaults to testnet; USDC_TOKEN defaults to Circle's testnet USDC SAC.)
+#
+# Each contract's admin is set by its constructor in the same transaction that
+# deploys it, so there is never an uninitialised contract anyone could claim.
+# The vault is then pointed at the registry so disburse() works immediately.
 # ─────────────────────────────────────────────────────────────────────────────
 
 set -euo pipefail
 
-NETWORK="testnet"
-RPC_URL="https://soroban-testnet.stellar.org"
-NETWORK_PASSPHRASE="Test SDF Network ; September 2015"
+NETWORK="${NETWORK:-testnet}"
 
 # USDC on Stellar testnet (Circle's deployed SAC)
 USDC_TESTNET="CBIELTK6YBZJU5UP2WWQEQZMYJMZROFZKYPVCCNWY5TU4BOQ3EOWXPD"
+USDC_TOKEN="${USDC_TOKEN:-$USDC_TESTNET}"
 
-ADMIN="${ADMIN_ACCOUNT:?Set ADMIN_ACCOUNT env var to your Stellar testnet address}"
+ADMIN="${ADMIN_ACCOUNT:?Set ADMIN_ACCOUNT to a Stellar CLI key name or G... address}"
+ADMIN_ADDRESS=$(stellar keys address "$ADMIN" 2>/dev/null || echo "$ADMIN")
 
 echo ""
 echo "══════════════════════════════════════════════"
-echo "  ShieldFund — Soroban testnet deployment"
+echo "  ShieldFund — Soroban deployment"
 echo "══════════════════════════════════════════════"
-echo "  Admin :  $ADMIN"
+echo "  Admin  : $ADMIN_ADDRESS"
 echo "  Network: $NETWORK"
+echo "  Token  : $USDC_TOKEN"
 echo ""
 
 # ── 1. Build all contracts ─────────────────────────────────────────────────
@@ -40,84 +44,70 @@ echo ""
 echo "▸ Building contracts (release WASM)…"
 stellar contract build
 
-WASM_DIR="target/wasm32-unknown-unknown/release"
+WASM_DIR="target/wasm32v1-none/release"
 
-# ── 2. Deploy Treasury Vault ───────────────────────────────────────────────
+deploy() {
+  local wasm="$1"; shift
+  stellar contract deploy \
+    --wasm "$WASM_DIR/$wasm" \
+    --source "$ADMIN" \
+    --network "$NETWORK" \
+    -- "$@"
+}
+
+# ── 2. Deploy (constructor sets admin atomically) ──────────────────────────
 
 echo ""
-echo "▸ Deploying treasury_vault…"
-VAULT_ID=$(stellar contract deploy \
-  --wasm "$WASM_DIR/treasury_vault.wasm" \
-  --source "$ADMIN" \
-  --network "$NETWORK" \
-  --rpc-url "$RPC_URL" \
-  --network-passphrase "$NETWORK_PASSPHRASE")
+echo "▸ Deploying proof_registry…"
+REGISTRY_ID=$(deploy proof_registry.wasm --admin "$ADMIN_ADDRESS")
+echo "  proof_registry : $REGISTRY_ID"
 
+echo "▸ Deploying treasury_vault…"
+VAULT_ID=$(deploy treasury_vault.wasm --admin "$ADMIN_ADDRESS" --usdc_token "$USDC_TOKEN")
 echo "  treasury_vault : $VAULT_ID"
 
-echo "▸ Initializing treasury_vault…"
+echo "▸ Deploying streaming…"
+STREAMING_ID=$(deploy streaming.wasm --admin "$ADMIN_ADDRESS" --usdc_token "$USDC_TOKEN")
+echo "  streaming      : $STREAMING_ID"
+
+# ── 3. Wire the vault to the registry ──────────────────────────────────────
+
+echo ""
+echo "▸ Pointing treasury_vault at proof_registry…"
 stellar contract invoke \
   --id "$VAULT_ID" \
   --source "$ADMIN" \
   --network "$NETWORK" \
-  -- initialize \
-  --admin "$ADMIN" \
-  --usdc_token "$USDC_TESTNET"
+  -- set_proof_registry \
+  --registry "$REGISTRY_ID"
 
-# ── 3. Deploy Streaming ────────────────────────────────────────────────────
+# ── 4. Sanity checks ───────────────────────────────────────────────────────
 
-echo ""
-echo "▸ Deploying streaming…"
-STREAMING_ID=$(stellar contract deploy \
-  --wasm "$WASM_DIR/streaming.wasm" \
-  --source "$ADMIN" \
-  --network "$NETWORK" \
-  --rpc-url "$RPC_URL" \
-  --network-passphrase "$NETWORK_PASSPHRASE")
-
-echo "  streaming : $STREAMING_ID"
-
-echo "▸ Initializing streaming…"
-stellar contract invoke \
-  --id "$STREAMING_ID" \
-  --source "$ADMIN" \
-  --network "$NETWORK" \
-  -- initialize \
-  --admin "$ADMIN" \
-  --usdc_token "$USDC_TESTNET"
-
-# ── 4. Deploy Proof Registry ───────────────────────────────────────────────
-
-echo ""
-echo "▸ Deploying proof_registry…"
-REGISTRY_ID=$(stellar contract deploy \
-  --wasm "$WASM_DIR/proof_registry.wasm" \
-  --source "$ADMIN" \
-  --network "$NETWORK" \
-  --rpc-url "$RPC_URL" \
-  --network-passphrase "$NETWORK_PASSPHRASE")
-
-echo "  proof_registry : $REGISTRY_ID"
-
-echo "▸ Initializing proof_registry…"
-stellar contract invoke \
-  --id "$REGISTRY_ID" \
-  --source "$ADMIN" \
-  --network "$NETWORK" \
-  -- initialize \
-  --admin "$ADMIN"
+for id in "$REGISTRY_ID" "$VAULT_ID" "$STREAMING_ID"; do
+  got=$(stellar contract invoke --id "$id" --source "$ADMIN" --network "$NETWORK" -- get_admin | tr -d '"')
+  if [ "$got" != "$ADMIN_ADDRESS" ]; then
+    echo "✗ $id reports admin $got, expected $ADMIN_ADDRESS" >&2
+    exit 1
+  fi
+done
+got=$(stellar contract invoke --id "$VAULT_ID" --source "$ADMIN" --network "$NETWORK" -- get_proof_registry | tr -d '"')
+if [ "$got" != "$REGISTRY_ID" ]; then
+  echo "✗ treasury_vault is wired to $got, expected $REGISTRY_ID" >&2
+  exit 1
+fi
+echo "✓ admin set on all three contracts, vault wired to registry"
 
 # ── 5. Print summary ───────────────────────────────────────────────────────
 
 echo ""
 echo "══════════════════════════════════════════════"
-echo "  Deployment complete — copy into contracts.ts"
+echo "  Deployment complete"
 echo "══════════════════════════════════════════════"
 echo ""
 echo "  TREASURY_VAULT : $VAULT_ID"
 echo "  STREAMING      : $STREAMING_ID"
 echo "  PROOF_REGISTRY : $REGISTRY_ID"
-echo "  USDC_SAC       : $USDC_TESTNET"
+echo "  USDC_SAC       : $USDC_TOKEN"
 echo ""
-echo "  → paste these into src/lib/contracts.ts → CONTRACT_IDS.TESTNET"
+echo "  → paste these into shieldfund-frontend src/lib/contracts.ts and the backend .env"
 echo ""
