@@ -36,9 +36,12 @@ shieldfund-contracts (Cargo workspace)
 │   ├── is_proof_spent()    read-only: has this proof already paid out?
 │   ├── get_balance()       read-only: live vault token balance
 │   ├── get_stats()         read-only: { vault_balance, total_raised, total_disbursed }
+│   ├── set_proof_registry() / get_proof_registry()
 │   ├── get_admin()
 │   ├── get_token()
-│   └── transfer_admin()    (auth: current admin)
+│   ├── propose_admin()     step 1 of admin transfer (auth: current admin)
+│   ├── accept_admin()      step 2 (auth: nominee)
+│   └── cancel_admin_transfer() / get_pending_admin()
 │
 ├── streaming               ← Real-time payment engine
 │   ├── __constructor()     runs at deploy: sets admin + token SAC
@@ -48,20 +51,27 @@ shieldfund-contracts (Cargo workspace)
 │   ├── get_accumulated()   simulation call: accumulated + elapsed × rate
 │   ├── withdraw()          recipient claims tokens (auth: recipient)
 │   ├── get_stream()        read single Stream record
-│   ├── get_all_streams()   read all Stream records
-│   └── get_admin()
+│   ├── get_stream_count() / get_streams(start, limit)   paginated reads
+│   ├── get_all_streams()   deprecated — unbounded
+│   ├── get_admin()
+│   ├── propose_admin()     step 1 of admin transfer (auth: current admin)
+│   ├── accept_admin()      step 2 (auth: nominee)
+│   └── cancel_admin_transfer() / get_pending_admin()
 │
 └── proof_registry          ← ZK proof anchor store
     ├── __constructor()     runs at deploy: sets admin
-    ├── register_proof()    stores ProofEntry + hash index (auth: submitter)
-    │                       panics on duplicate hash
+    ├── register_proof()    stores ProofEntry + hash index (auth: admin)
+    │                       rejects duplicates and unknown proof types
     ├── get_proof()         read by sequential ID
-    ├── get_all_proofs()    read all ProofEntry records
+    ├── get_proof_count() / get_proofs(start, limit)     paginated reads
+    ├── get_all_proofs()    deprecated — unbounded
     ├── verify_proof_exists() bool check by hash (O(1))
     ├── get_id_by_hash()    reverse lookup: hash → id
     ├── get_proof_by_hash() full ProofEntry by hash
     ├── get_admin()
-    └── transfer_admin()    (auth: current admin)
+    ├── propose_admin()     step 1 of admin transfer (auth: current admin)
+    ├── accept_admin()      step 2 (auth: nominee)
+    └── cancel_admin_transfer() / get_pending_admin()
 ```
 
 ### How the contracts interact
@@ -102,7 +112,12 @@ streaming contract
 | `get_stats` | — | — | `VaultStats` |
 | `get_admin` | — | — | `Address` |
 | `get_token` | — | — | `Address` |
-| `transfer_admin` | `admin` | `new_admin: Address` | — |
+| `set_proof_registry` | `admin` | `registry: Address` | — |
+| `get_proof_registry` | — | — | `Address` |
+| `propose_admin` | `admin` | `new_admin: Address` | — |
+| `accept_admin` | nominee | — | — |
+| `cancel_admin_transfer` | `admin` | — | — |
+| `get_pending_admin` | — | — | `Option<Address>` |
 
 `amount` is always in **stroops** (7 decimal places). 1 XLM = 10,000,000 stroops.
 
@@ -116,8 +131,14 @@ streaming contract
 | `get_accumulated` | — | `stream_id: u32` | `i128` |
 | `withdraw` | `recipient` | `stream_id: u32` | `i128` (amount paid) |
 | `get_stream` | — | `stream_id: u32` | `Stream` |
-| `get_all_streams` | — | — | `Vec<Stream>` |
+| `get_stream_count` | — | — | `u32` |
+| `get_streams` | — | `start: u32`, `limit: u32` (1–50) | `Vec<Stream>` |
+| `get_all_streams` | — | — | `Vec<Stream>` (deprecated) |
 | `get_admin` | — | — | `Address` |
+| `propose_admin` | `admin` | `new_admin: Address` | — |
+| `accept_admin` | nominee | — | — |
+| `cancel_admin_transfer` | `admin` | — | — |
+| `get_pending_admin` | — | — | `Option<Address>` |
 
 **Flow rate formula:** `flow_rate_per_second = ceil(monthly_amount_stroops / 2_592_000)`
 
@@ -131,16 +152,71 @@ flow_rate = ceil(50_000_000_000 / 2_592_000) = 19_291 stroops/sec
 | Function | Auth | Parameters | Returns |
 |----------|------|-----------|---------|
 | `__constructor` | (deploy) | `admin: Address` | — |
-| `register_proof` | `submitter` | `submitter: Address`, `proof_hash: BytesN<32>`, `public_inputs_hash: BytesN<32>`, `proof_type: Symbol` | `u32` (proof ID) |
+| `register_proof` | `submitter` (must be admin) | `submitter: Address`, `proof_hash: BytesN<32>`, `public_inputs_hash: BytesN<32>`, `proof_type: Symbol` | `u32` (proof ID) |
 | `get_proof` | — | `id: u32` | `ProofEntry` |
-| `get_all_proofs` | — | — | `Vec<ProofEntry>` |
+| `get_proof_count` | — | — | `u32` |
+| `get_proofs` | — | `start: u32`, `limit: u32` (1–50) | `Vec<ProofEntry>` |
+| `get_all_proofs` | — | — | `Vec<ProofEntry>` (deprecated) |
 | `verify_proof_exists` | — | `proof_hash: BytesN<32>` | `bool` |
 | `get_id_by_hash` | — | `proof_hash: BytesN<32>` | `u32` |
 | `get_proof_by_hash` | — | `proof_hash: BytesN<32>` | `ProofEntry` |
 | `get_admin` | — | — | `Address` |
-| `transfer_admin` | `admin` | `new_admin: Address` | — |
+| `propose_admin` | `admin` | `new_admin: Address` | — |
+| `accept_admin` | nominee | — | — |
+| `cancel_admin_transfer` | `admin` | — | — |
+| `get_pending_admin` | — | — | `Option<Address>` |
 
 `proof_type` is a Soroban `Symbol` (max 9 chars): `"payroll"`, `"operational"`, `"relief"`.
+
+### Admin transfer is two-step
+
+`propose_admin(new)` only records a nominee; nothing changes until `new` signs `accept_admin()`. A typo in
+the address can't brick a contract: the wrong nominee can never accept, and the admin can
+`cancel_admin_transfer()` or propose again. The old one-call `transfer_admin` has been removed.
+
+### Pagination
+
+`get_proofs(start, limit)` / `get_streams(start, limit)` return ids `start..start+limit` (`limit` 1–50). Read the
+`get_*_count()` first, then page through. `get_all_*` still exist for current clients but are deprecated:
+their cost grows with the data set and will eventually exceed Soroban's read limits.
+
+### Errors
+
+Every failure is a typed `contracterror`, surfaced to clients as `Error(Contract, #code)`:
+
+| Code | `treasury_vault` | `streaming` | `proof_registry` |
+|-----:|---|---|---|
+| 1 | `InvalidAmount` | `InvalidFlowRate` | `NotAdmin` |
+| 2 | `RegistryNotConfigured` | `InvalidEndTime` | `AlreadyRegistered` |
+| 3 | `ProofNotRegistered` | `InsufficientBalance` | `ProofNotFound` |
+| 4 | `ProofAlreadySpent` | `StreamNotFound` | `InvalidProofType` |
+| 5 | `ProofMismatch` | `StreamCompleted` | `NoPendingAdmin` |
+| 6 | `InsufficientBalance` | `NothingToWithdraw` | `InvalidPageSize` |
+| 7 | `UnknownProofType` | `Overflow` | |
+| 8 | `InvalidRecipient` | `NoPendingAdmin` | |
+| 9 | `Overflow` | `InvalidPageSize` | |
+| 10 | `NoPendingAdmin` | | |
+
+Missing auth still fails with the host's auth error, not a contract error.
+
+### Events
+
+Every state change emits an event, so an indexer can follow the contracts through RPC `getEvents` instead
+of polling. Topics are `(name, key)`:
+
+| Contract | Topics | Data |
+|---|---|---|
+| vault | `("deposit", depositor)` | `amount: i128` |
+| vault | `("disburse", recipient)` | `(amount: i128, proof_hash)` |
+| vault | `("reg_set", admin)` | `registry: Address` |
+| streaming | `("s_create", recipient)` | `(id: u32, flow_rate_per_second: i128, end_time: u64)` |
+| streaming | `("s_toggle", id)` | new `StreamStatus` |
+| streaming | `("s_wdraw", id)` | `(recipient, payout: i128)` |
+| streaming | `("s_done", id)` | `recipient` (stream completed) |
+| registry | `("p_reg", submitter)` | `(id: u32, proof_hash, public_inputs_hash, proof_type)` |
+| all | `("adm_prop", admin)` | nominee `Address` |
+| all | `("adm_acpt", new_admin)` | previous admin `Address` |
+| all | `("adm_cncl", admin)` | cancelled nominee `Address` |
 
 ---
 
@@ -282,7 +358,7 @@ shieldfund-contracts/
 │
 ├── treasury_vault/
 │   ├── Cargo.toml
-│   └── src/lib.rs                 # deposit, disburse, get_stats, transfer_admin
+│   └── src/lib.rs                 # deposit, disburse, get_stats, two-step admin
 │
 ├── streaming/
 │   ├── Cargo.toml
@@ -291,11 +367,13 @@ shieldfund-contracts/
 │
 ├── proof_registry/
 │   ├── Cargo.toml
-│   └── src/lib.rs                 # register_proof, verify_proof_exists, get_all_proofs
+│   └── src/lib.rs                 # register_proof, verify_proof_exists, get_proofs (paginated)
 │                                  # includes #[cfg(test)] suite
 │
-└── scripts/
-    └── deploy-testnet.sh          # Build + deploy all 3 contracts + wire vault → registry
+├── scripts/
+│   └── deploy-testnet.sh          # Build + deploy all 3 contracts + wire vault → registry
+│
+└── AUDIT.md                       # Scope, invariants and known issues for external review
 ```
 
 ---
