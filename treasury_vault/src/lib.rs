@@ -1,8 +1,39 @@
 #![no_std]
 use soroban_sdk::{
-    contract, contractimpl, contracttype, symbol_short, vec,
+    contract, contracterror, contractimpl, contracttype, panic_with_error, symbol_short, vec,
     token, Address, Bytes, BytesN, Env, IntoVal, Symbol, Val, U256,
 };
+
+/// Every way a call can fail. Clients receive these as `Error(Contract, #code)`.
+#[contracterror]
+#[derive(Copy, Clone, Debug, Eq, PartialEq, PartialOrd, Ord)]
+#[repr(u32)]
+pub enum Error {
+    /// `amount` must be positive.
+    InvalidAmount = 1,
+    /// `set_proof_registry` hasn't been called.
+    RegistryNotConfigured = 2,
+    /// The proof hash isn't registered in proof_registry.
+    ProofNotRegistered = 3,
+    /// The proof has already paid out a disbursement.
+    ProofAlreadyUsed = 4,
+    /// The proof wasn't generated for this recipient, amount, root and commitment.
+    ProofMismatch = 5,
+    /// The vault holds less than `amount`.
+    InsufficientBalance = 6,
+    /// The registered proof type isn't payroll, operational or relief.
+    UnknownProofType = 7,
+    /// The recipient's strkey isn't 56 characters.
+    InvalidAddress = 8,
+    /// There's no admin handover to accept or cancel.
+    NoPendingAdmin = 9,
+}
+
+fn ensure(env: &Env, condition: bool, error: Error) {
+    if !condition {
+        panic_with_error!(env, error);
+    }
+}
 
 // ── Storage keys ──────────────────────────────────────────────────────────────
 
@@ -66,7 +97,7 @@ fn proof_type_id(env: &Env, proof_type: &Symbol) -> u32 {
     } else if *proof_type == Symbol::new(env, "relief") {
         2
     } else {
-        panic!("unknown proof_type")
+        panic_with_error!(&env, Error::UnknownProofType)
     }
 }
 
@@ -76,7 +107,7 @@ fn proof_type_id(env: &Env, proof_type: &Symbol) -> u32 {
 fn recipient_field(env: &Env, recipient: &Address) -> BytesN<32> {
     let strkey = recipient.to_string();
     let mut buf = [0u8; 56];
-    assert!(strkey.len() as usize == buf.len(), "unexpected address length");
+    ensure(env, strkey.len() as usize == buf.len(), Error::InvalidAddress);
     strkey.copy_into_slice(&mut buf);
     let digest: Bytes = env.crypto().keccak256(&Bytes::from_slice(env, &buf)).into();
     let modulus = U256::from_be_bytes(env, &Bytes::from_array(env, &FIELD_MODULUS));
@@ -157,7 +188,7 @@ impl TreasuryVaultContract {
     pub fn deposit(env: Env, depositor: Address, amount: i128) {
         depositor.require_auth();
         bump_instance(&env);
-        assert!(amount > 0, "amount must be positive");
+        ensure(&env, amount > 0, Error::InvalidAmount);
 
         let token_addr: Address = env.storage().instance().get(&DataKey::Token).unwrap();
         let token_client = token::Client::new(&env, &token_addr);
@@ -198,7 +229,7 @@ impl TreasuryVaultContract {
         env.storage()
             .instance()
             .get(&DataKey::ProofRegistry)
-            .expect("proof registry not configured")
+            .unwrap_or_else(|| panic_with_error!(&env, Error::RegistryNotConfigured))
     }
 
     /// Admin-only: disburse USDC to a recipient.
@@ -223,25 +254,22 @@ impl TreasuryVaultContract {
         let admin: Address = env.storage().instance().get(&DataKey::Admin).unwrap();
         admin.require_auth();
         bump_instance(&env);
-        assert!(amount > 0, "amount must be positive");
+        ensure(&env, amount > 0, Error::InvalidAmount);
 
         let registry: Address = env
             .storage()
             .instance()
             .get(&DataKey::ProofRegistry)
-            .expect("proof registry not configured");
+            .unwrap_or_else(|| panic_with_error!(&env, Error::RegistryNotConfigured));
         let proof_exists: bool = env.invoke_contract(
             &registry,
             &Symbol::new(&env, "verify_proof_exists"),
             vec![&env, proof_hash.into_val(&env)],
         );
-        assert!(proof_exists, "proof_hash not registered in proof_registry");
+        ensure(&env, proof_exists, Error::ProofNotRegistered);
 
         let spent_key = DataKey::SpentProof(proof_hash.clone());
-        assert!(
-            !env.storage().persistent().has(&spent_key),
-            "proof already used for a disbursement"
-        );
+        ensure(&env, !env.storage().persistent().has(&spent_key), Error::ProofAlreadyUsed);
 
         let entry: ProofEntry = env.invoke_contract(
             &registry,
@@ -256,10 +284,7 @@ impl TreasuryVaultContract {
             amount,
             proof_type_id(&env, &entry.proof_type),
         );
-        assert!(
-            entry.public_inputs_hash == expected,
-            "proof does not match this recipient and amount"
-        );
+        ensure(&env, entry.public_inputs_hash == expected, Error::ProofMismatch);
         env.storage().persistent().set(&spent_key, &true);
         bump(&env, &spent_key);
 
@@ -268,7 +293,7 @@ impl TreasuryVaultContract {
 
         // Verify the vault can cover this disbursement.
         let balance = token_client.balance(&env.current_contract_address());
-        assert!(balance >= amount, "insufficient vault balance");
+        ensure(&env, balance >= amount, Error::InsufficientBalance);
 
         // The vault contract is the owner of its own USDC balance, so no
         // extra auth entry is required for this transfer.
@@ -352,7 +377,7 @@ impl TreasuryVaultContract {
             .storage()
             .instance()
             .get(&DataKey::PendingAdmin)
-            .expect("no pending admin");
+            .unwrap_or_else(|| panic_with_error!(&env, Error::NoPendingAdmin));
         pending.require_auth();
         bump_instance(&env);
         let old: Address = env.storage().instance().get(&DataKey::Admin).unwrap();
@@ -366,9 +391,10 @@ impl TreasuryVaultContract {
         let admin: Address = env.storage().instance().get(&DataKey::Admin).unwrap();
         admin.require_auth();
         bump_instance(&env);
-        assert!(
+        ensure(
+            &env,
             env.storage().instance().has(&DataKey::PendingAdmin),
-            "no pending admin"
+            Error::NoPendingAdmin,
         );
         env.storage().instance().remove(&DataKey::PendingAdmin);
         env.events().publish((symbol_short!("adm_cncl"), admin), ());
@@ -557,7 +583,7 @@ mod tests {
     }
 
     #[test]
-    #[should_panic(expected = "no pending admin")]
+    #[should_panic(expected = "Error(Contract, #9)")]
     fn accept_without_a_proposal_panics() {
         let env = Env::default();
         env.mock_all_auths();
@@ -621,7 +647,7 @@ mod tests {
     }
 
     #[test]
-    #[should_panic(expected = "insufficient vault balance")]
+    #[should_panic(expected = "Error(Contract, #6)")]
     fn disbursing_more_than_the_vault_holds_panics() {
         let env = Env::default();
         env.mock_all_auths();
@@ -644,6 +670,30 @@ mod tests {
         assert_eq!(stats.total_raised, 1_250_000);
         assert_eq!(stats.total_disbursed, 500_000);
         assert_eq!(stats.vault_balance, stats.total_raised - stats.total_disbursed);
+    }
+
+    #[test]
+    fn clients_get_typed_errors() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let hash = some_hash(&env, 1);
+        let setup = ready(&env, &hash, PIH_500000_PAYROLL, "payroll");
+        let v = &setup.vault;
+
+        assert_eq!(v.try_deposit(&setup.admin, &0), Err(Ok(soroban_sdk::Error::from(Error::InvalidAmount))));
+        assert_eq!(
+            v.try_disburse(&recipient(&env), &1, &hash, &root(&env), &commitment(&env)),
+            Err(Ok(soroban_sdk::Error::from(Error::ProofMismatch)))
+        );
+        assert_eq!(
+            v.try_disburse(&recipient(&env), &1, &some_hash(&env, 9), &root(&env), &commitment(&env)),
+            Err(Ok(soroban_sdk::Error::from(Error::ProofNotRegistered)))
+        );
+        v.disburse(&recipient(&env), &500_000, &hash, &root(&env), &commitment(&env));
+        assert_eq!(
+            v.try_disburse(&recipient(&env), &500_000, &hash, &root(&env), &commitment(&env)),
+            Err(Ok(soroban_sdk::Error::from(Error::ProofAlreadyUsed)))
+        );
     }
 
     #[test]
@@ -688,7 +738,7 @@ mod tests {
     }
 
     #[test]
-    #[should_panic(expected = "proof registry not configured")]
+    #[should_panic(expected = "Error(Contract, #2)")]
     fn disburse_without_registry_configured_panics() {
         let env = Env::default();
         env.mock_all_auths();
@@ -699,7 +749,7 @@ mod tests {
     }
 
     #[test]
-    #[should_panic(expected = "proof_hash not registered in proof_registry")]
+    #[should_panic(expected = "Error(Contract, #3)")]
     fn disburse_with_unregistered_hash_panics() {
         let env = Env::default();
         env.mock_all_auths();
@@ -726,7 +776,7 @@ mod tests {
     }
 
     #[test]
-    #[should_panic(expected = "proof already used for a disbursement")]
+    #[should_panic(expected = "Error(Contract, #4)")]
     fn replaying_a_proof_panics() {
         let env = Env::default();
         env.mock_all_auths();
@@ -738,7 +788,7 @@ mod tests {
     }
 
     #[test]
-    #[should_panic(expected = "proof does not match this recipient and amount")]
+    #[should_panic(expected = "Error(Contract, #5)")]
     fn wrong_amount_panics() {
         let env = Env::default();
         env.mock_all_auths();
@@ -749,7 +799,7 @@ mod tests {
     }
 
     #[test]
-    #[should_panic(expected = "proof does not match this recipient and amount")]
+    #[should_panic(expected = "Error(Contract, #5)")]
     fn wrong_recipient_panics() {
         let env = Env::default();
         env.mock_all_auths();
@@ -760,7 +810,7 @@ mod tests {
     }
 
     #[test]
-    #[should_panic(expected = "proof does not match this recipient and amount")]
+    #[should_panic(expected = "Error(Contract, #5)")]
     fn wrong_proof_type_panics() {
         let env = Env::default();
         env.mock_all_auths();
@@ -772,7 +822,7 @@ mod tests {
     }
 
     #[test]
-    #[should_panic(expected = "proof does not match this recipient and amount")]
+    #[should_panic(expected = "Error(Contract, #5)")]
     fn wrong_merkle_root_panics() {
         let env = Env::default();
         env.mock_all_auths();

@@ -186,6 +186,49 @@ A registered proof only authorises the one payment it was generated for:
 `merkle_root` and `budget_commitment` come back from the proof server's `/api/prove`
 response alongside `proof_hash`.
 
+### Error codes
+
+Failed calls return `Error(Contract, #code)`; the codes are exported in each contract's
+interface (`stellar contract info interface`), so generated client bindings name them.
+
+**treasury_vault**
+
+| Code | Name | Meaning |
+|---|---|---|
+| 1 | `InvalidAmount` | `amount` must be positive. |
+| 2 | `RegistryNotConfigured` | `set_proof_registry` hasn't been called. |
+| 3 | `ProofNotRegistered` | The proof hash isn't registered in proof_registry. |
+| 4 | `ProofAlreadyUsed` | The proof has already paid out a disbursement. |
+| 5 | `ProofMismatch` | The proof wasn't generated for this recipient, amount, root and commitment. |
+| 6 | `InsufficientBalance` | The vault holds less than `amount`. |
+| 7 | `UnknownProofType` | The registered proof type isn't payroll, operational or relief. |
+| 8 | `InvalidAddress` | The recipient's strkey isn't 56 characters. |
+| 9 | `NoPendingAdmin` | There's no admin handover to accept or cancel. |
+
+**proof_registry**
+
+| Code | Name | Meaning |
+|---|---|---|
+| 1 | `NotAdmin` | The caller isn't the admin. |
+| 2 | `UnknownProofType` | `proof_type` isn't payroll, operational or relief. |
+| 3 | `AlreadyRegistered` | This proof hash is already registered. |
+| 4 | `ProofNotFound` | No proof with this id or hash. |
+| 5 | `NoPendingAdmin` | There's no admin handover to accept or cancel. |
+
+**streaming**
+
+| Code | Name | Meaning |
+|---|---|---|
+| 1 | `InvalidFlowRate` | `flow_rate_per_second` must be positive. |
+| 2 | `InvalidEndTime` | `end_time` must be in the future. |
+| 3 | `Overflow` | The stream's total doesn't fit in an i128. |
+| 4 | `InsufficientBalance` | The unreserved balance can't cover this stream. |
+| 5 | `StreamNotFound` | No stream with this id. |
+| 6 | `StreamEnded` | The stream's `end_time` has passed, so it can't be resumed. |
+| 7 | `StreamCompleted` | The stream is completed. |
+| 8 | `NothingToWithdraw` | Nothing has accrued since the last withdrawal. |
+| 9 | `NoPendingAdmin` | There's no admin handover to accept or cancel. |
+
 ### Events
 
 Every state change emits an event, so an indexer can rebuild all contract state from
