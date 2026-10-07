@@ -45,10 +45,9 @@ pub struct ProofRegistryContract;
 
 #[contractimpl]
 impl ProofRegistryContract {
-    pub fn initialize(env: Env, admin: Address) {
-        if env.storage().instance().has(&DataKey::Admin) {
-            panic!("already initialized");
-        }
+    /// Runs once, atomically with deployment, so there is no window in which
+    /// someone else could claim the admin role on an uninitialised contract.
+    pub fn __constructor(env: Env, admin: Address) {
         env.storage().instance().set(&DataKey::Admin, &admin);
         env.storage().persistent().set(&DataKey::ProofCount, &0u32);
     }
@@ -184,14 +183,13 @@ mod tests {
     use super::*;
     use soroban_sdk::{
         testutils::Address as _,
-        BytesN, Env, Symbol,
+        BytesN, Env, IntoVal, Symbol,
     };
 
     fn deploy(env: &Env) -> (ProofRegistryContractClient<'_>, Address) {
         let admin = Address::generate(env);
-        let contract_id = env.register(ProofRegistryContract, ());
+        let contract_id = env.register(ProofRegistryContract, (admin.clone(),));
         let client = ProofRegistryContractClient::new(env, &contract_id);
-        client.initialize(&admin);
         (client, admin)
     }
 
@@ -271,6 +269,26 @@ mod tests {
         assert_eq!(id0, 0);
         assert_eq!(id1, 1);
         assert_eq!(client.get_all_proofs().len(), 2);
+    }
+
+    #[test]
+    fn constructor_sets_admin() {
+        let env = Env::default();
+        let (client, admin) = deploy(&env);
+        assert_eq!(client.get_admin(), admin);
+    }
+
+    #[test]
+    fn there_is_no_initialize_entrypoint_to_front_run() {
+        let env = Env::default();
+        let (client, _) = deploy(&env);
+        let attacker = Address::generate(&env);
+        let res = env.try_invoke_contract::<(), soroban_sdk::Error>(
+            &client.address,
+            &Symbol::new(&env, "initialize"),
+            soroban_sdk::vec![&env, attacker.into_val(&env)],
+        );
+        assert!(res.is_err());
     }
 
     #[test]

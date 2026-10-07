@@ -51,10 +51,9 @@ pub struct StreamingContract;
 
 #[contractimpl]
 impl StreamingContract {
-    pub fn initialize(env: Env, admin: Address, usdc_token: Address) {
-        if env.storage().instance().has(&DataKey::Admin) {
-            panic!("already initialized");
-        }
+    /// Runs once, atomically with deployment, so there is no window in which
+    /// someone else could claim the admin role on an uninitialised contract.
+    pub fn __constructor(env: Env, admin: Address, usdc_token: Address) {
         env.storage().instance().set(&DataKey::Admin, &admin);
         env.storage().instance().set(&DataKey::Token, &usdc_token);
         env.storage().persistent().set(&DataKey::StreamCount, &0u32);
@@ -283,10 +282,37 @@ impl StreamingContract {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use soroban_sdk::{testutils::{Address as _, Ledger}, Env};
+    use soroban_sdk::{testutils::{Address as _, Ledger}, vec, Env, IntoVal, Symbol};
 
     fn setup_env() -> Env {
         Env::default()
+    }
+
+    fn deploy(env: &Env) -> (StreamingContractClient<'_>, Address) {
+        let admin = Address::generate(env);
+        let token = env.register_stellar_asset_contract_v2(admin.clone()).address();
+        let id = env.register(StreamingContract, (admin.clone(), token));
+        (StreamingContractClient::new(env, &id), admin)
+    }
+
+    #[test]
+    fn constructor_sets_admin() {
+        let env = setup_env();
+        let (client, admin) = deploy(&env);
+        assert_eq!(client.get_admin(), admin);
+    }
+
+    #[test]
+    fn there_is_no_initialize_entrypoint_to_front_run() {
+        let env = setup_env();
+        let (client, _) = deploy(&env);
+        let attacker = Address::generate(&env);
+        let res = env.try_invoke_contract::<(), soroban_sdk::Error>(
+            &client.address,
+            &Symbol::new(&env, "initialize"),
+            vec![&env, attacker.clone().into_val(&env), attacker.into_val(&env)],
+        );
+        assert!(res.is_err());
     }
 
     /// `get_accumulated` for an Active stream returns accumulated + elapsed * rate.
