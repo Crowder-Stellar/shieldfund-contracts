@@ -26,6 +26,9 @@ const DAY_IN_LEDGERS: u32 = 17_280; // ~5s ledgers
 const TTL_EXTEND_TO: u32 = 30 * DAY_IN_LEDGERS;
 const TTL_THRESHOLD: u32 = TTL_EXTEND_TO - DAY_IN_LEDGERS;
 
+/// Largest page `get_proofs` returns, keeping reads well inside resource limits.
+pub const MAX_PAGE: u32 = 50;
+
 fn bump_instance(env: &Env) {
     env.storage().instance().extend_ttl(TTL_THRESHOLD, TTL_EXTEND_TO);
 }
@@ -148,7 +151,34 @@ impl ProofRegistryContract {
             .expect("proof not found")
     }
 
-    /// Returns all registered proofs.
+    /// Returns up to `limit` proofs (max `MAX_PAGE`) starting at id `start`,
+    /// in id order. Page through with `start += returned.len()` until
+    /// `start >= get_proof_count()`.
+    pub fn get_proofs(env: Env, start: u32, limit: u32) -> Vec<ProofEntry> {
+        let count = Self::get_proof_count(env.clone());
+        let end = start.saturating_add(limit.min(MAX_PAGE)).min(count);
+        let mut proofs = Vec::new(&env);
+        for i in start..end {
+            if let Some(p) = env
+                .storage()
+                .persistent()
+                .get::<DataKey, ProofEntry>(&DataKey::Proof(i))
+            {
+                proofs.push_back(p);
+            }
+        }
+        proofs
+    }
+
+    pub fn get_proof_count(env: Env) -> u32 {
+        env.storage()
+            .persistent()
+            .get(&DataKey::ProofCount)
+            .unwrap_or(0)
+    }
+
+    /// Returns all registered proofs. Unbounded: once there are many proofs
+    /// this exceeds per-call resource limits — use `get_proofs` instead.
     pub fn get_all_proofs(env: Env) -> Vec<ProofEntry> {
         let count: u32 = env
             .storage()
@@ -515,6 +545,45 @@ mod tests {
         let (_, topics, data) = env.events().all().last().unwrap();
         assert_eq!(topics, soroban_sdk::vec![&env, symbol_short!("adm_acc").into_val(&env), admin.into_val(&env)]);
         assert_eq!(Address::from_val(&env, &data), nominee);
+    }
+
+    #[test]
+    fn proofs_page_in_id_order_and_cap_at_max_page() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (client, admin) = deploy(&env);
+        let pt = Symbol::new(&env, "payroll");
+        for i in 0..60u8 {
+            client.register_proof(&admin, &BytesN::from_array(&env, &[i; 32]), &zero_hash(&env), &pt);
+        }
+        assert_eq!(client.get_proof_count(), 60);
+
+        let first = client.get_proofs(&0, &20);
+        assert_eq!(first.len(), 20);
+        assert_eq!(first.get(0).unwrap().id, 0);
+        assert_eq!(first.get(19).unwrap().id, 19);
+
+        // limit is capped, and the last page is short
+        assert_eq!(client.get_proofs(&0, &1_000).len(), MAX_PAGE);
+        let last = client.get_proofs(&50, &50);
+        assert_eq!(last.len(), 10);
+        assert_eq!(last.get(9).unwrap().id, 59);
+
+        // walking the pages visits every proof exactly once
+        let mut seen = 0u32;
+        let mut start = 0u32;
+        while start < client.get_proof_count() {
+            let page = client.get_proofs(&start, &MAX_PAGE);
+            for p in page.iter() {
+                assert_eq!(p.id, seen);
+                seen += 1;
+            }
+            start += page.len();
+        }
+        assert_eq!(seen, 60);
+
+        assert_eq!(client.get_proofs(&60, &10).len(), 0);
+        assert_eq!(client.get_proofs(&u32::MAX, &u32::MAX).len(), 0);
     }
 
     #[test]
