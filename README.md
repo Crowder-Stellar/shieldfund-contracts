@@ -176,6 +176,25 @@ A registered proof only authorises the one payment it was generated for:
 `merkle_root` and `budget_commitment` come back from the proof server's `/api/prove`
 response alongside `proof_hash`.
 
+### Events
+
+Every state change emits an event, so an indexer can rebuild all contract state from
+`getEvents` alone. Topics are `(name, key)`; `data` is the payload.
+
+| Contract | Topics | Data | When |
+|---|---|---|---|
+| all three | `("init", admin)` | `usdc_token` (vault, streaming) | deployed (registry: topics `("init",)`, data `admin`) |
+| all three | `("adm_prop", admin)` | `new_admin` | admin handover proposed |
+| all three | `("adm_acc", old_admin)` | `new_admin` | handover accepted |
+| all three | `("adm_cncl", admin)` | `()` | handover cancelled |
+| `proof_registry` | `("p_reg", submitter)` | `(id, proof_hash, proof_type)` | proof registered |
+| `treasury_vault` | `("deposit", depositor)` | `amount` | deposit |
+| `treasury_vault` | `("disburse", recipient)` | `(amount, proof_hash)` | disbursement |
+| `treasury_vault` | `("set_reg", admin)` | `registry` | vault wired to a registry |
+| `streaming` | `("s_create", recipient)` | `(id, flow_rate_per_second, end_time)` | stream created |
+| `streaming` | `("s_toggle", stream_id)` | new `StreamStatus` | paused / resumed |
+| `streaming` | `("s_wdraw", stream_id)` | `(recipient, amount, StreamStatus)` | withdrawal |
+
 ### Storage TTL
 
 Soroban archives storage entries whose TTL runs out. Every contract call bumps the

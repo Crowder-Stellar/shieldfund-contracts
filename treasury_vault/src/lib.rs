@@ -144,6 +144,7 @@ impl TreasuryVaultContract {
         bump_instance(&env);
         bump(&env, &DataKey::TotalRaised);
         bump(&env, &DataKey::TotalDisbursed);
+        env.events().publish((symbol_short!("init"), admin), usdc_token);
     }
 
     /// Deposit USDC into the vault.
@@ -190,6 +191,7 @@ impl TreasuryVaultContract {
         admin.require_auth();
         bump_instance(&env);
         env.storage().instance().set(&DataKey::ProofRegistry, &registry);
+        env.events().publish((symbol_short!("set_reg"), admin), registry);
     }
 
     pub fn get_proof_registry(env: Env) -> Address {
@@ -381,8 +383,9 @@ impl TreasuryVaultContract {
 mod tests {
     use super::*;
     use proof_registry::ProofRegistryContract;
+    use soroban_sdk::FromVal;
     use soroban_sdk::{
-        testutils::{storage::{Instance as _, Persistent as _}, Address as _, Ledger},
+        testutils::{storage::{Instance as _, Persistent as _}, Address as _, Events as _, Ledger},
         token::{Client as TokenClient, StellarAssetClient},
         Symbol,
     };
@@ -573,6 +576,28 @@ mod tests {
         assert_eq!(client.get_pending_admin(), None);
         assert!(client.try_accept_admin().is_err());
         assert_eq!(client.get_admin(), admin);
+    }
+
+    #[test]
+    fn wiring_and_disbursing_emit_events() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let hash = some_hash(&env, 1);
+        let setup = ready(&env, &hash, PIH_500000_PAYROLL, "payroll");
+
+        // events().all() holds the latest invocation's events, so re-wire and check.
+        setup.vault.set_proof_registry(&setup.registry.address);
+        let (contract, topics, data) = env.events().all().last().unwrap();
+        assert_eq!(contract, setup.vault.address);
+        assert_eq!(topics, vec![&env, symbol_short!("set_reg").into_val(&env), setup.admin.into_val(&env)]);
+        assert_eq!(Address::from_val(&env, &data), setup.registry.address);
+
+        setup.vault.disburse(&recipient(&env), &500_000, &hash, &root(&env), &commitment(&env));
+        let (contract, topics, data) = env.events().all().last().unwrap();
+        assert_eq!(contract, setup.vault.address);
+        assert_eq!(topics, vec![&env, symbol_short!("disburse").into_val(&env), recipient(&env).into_val(&env)]);
+        let (amount, proof): (i128, BytesN<32>) = data.into_val(&env);
+        assert_eq!((amount, proof), (500_000, hash));
     }
 
     #[test]
