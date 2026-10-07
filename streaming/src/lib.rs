@@ -46,6 +46,10 @@ pub enum Error {
     NoPendingAdmin = 8,
     /// Page `limit` is 0 or larger than `MAX_PAGE_SIZE`.
     InvalidPageSize = 9,
+    /// `reclaim` amount is zero or negative.
+    InvalidAmount = 10,
+    /// `close_stream` called before the stream's `end_time`.
+    StreamNotEnded = 11,
 }
 
 /// Largest page `get_streams` will return in one call.
@@ -110,6 +114,44 @@ fn release(env: &Env, stream_id: u32, amount: i128) {
     }
     let total = committed(env).saturating_sub(amount).max(0);
     env.storage().persistent().set(&DataKey::Committed, &total);
+}
+
+/// Pays the recipient everything owed at `now`, releases that part of the
+/// reservation, and — once `end_time` has passed — completes the stream and
+/// releases the rest. Shared by `withdraw` (recipient) and `close_stream`
+/// (admin). Emits `s_wdraw`, plus `s_done` on completion.
+fn settle(env: &Env, stream_id: u32, mut stream: Stream, now: u64) -> Result<i128, Error> {
+    let payout = owed(&stream, now)?;
+    if payout > 0 {
+        let token_addr: Address = env.storage().instance().get(&DataKey::Token).unwrap();
+        token::Client::new(env, &token_addr).transfer(
+            &env.current_contract_address(),
+            &stream.recipient,
+            &payout,
+        );
+        release(env, stream_id, payout);
+    }
+
+    stream.accumulated = 0;
+    stream.last_update = now;
+    let completed = now >= stream.end_time;
+    if completed {
+        stream.status = StreamStatus::Completed;
+        // Free whatever was reserved but never accrued (paused time).
+        release(env, stream_id, reserved(env, stream_id));
+    }
+
+    env.storage()
+        .persistent()
+        .set(&DataKey::Stream(stream_id), &stream);
+
+    env.events()
+        .publish((symbol_short!("s_wdraw"), stream_id), (stream.recipient.clone(), payout));
+    if completed {
+        env.events()
+            .publish((symbol_short!("s_done"), stream_id), stream.recipient);
+    }
+    Ok(payout)
 }
 
 fn load_stream(env: &Env, stream_id: u32) -> Result<Stream, Error> {
@@ -280,7 +322,7 @@ impl StreamingContract {
     /// Events: `("s_wdraw", stream_id)` → `(recipient, payout)`, then
     /// `("s_done", stream_id)` → `recipient` if the stream just completed.
     pub fn withdraw(env: Env, stream_id: u32) -> Result<i128, Error> {
-        let mut stream = load_stream(&env, stream_id)?;
+        let stream = load_stream(&env, stream_id)?;
         stream.recipient.require_auth();
 
         if stream.status == StreamStatus::Completed {
@@ -288,42 +330,53 @@ impl StreamingContract {
         }
 
         let now = env.ledger().timestamp();
-        let payout = owed(&stream, now)?;
-        let completed = now >= stream.end_time;
-        if payout <= 0 && !completed {
+        if owed(&stream, now)? <= 0 && now < stream.end_time {
             return Err(Error::NothingToWithdraw);
         }
-
-        if payout > 0 {
-            let token_addr: Address = env.storage().instance().get(&DataKey::Token).unwrap();
-            token::Client::new(&env, &token_addr).transfer(
-                &env.current_contract_address(),
-                &stream.recipient,
-                &payout,
-            );
-            release(&env, stream_id, payout);
-        }
-
-        stream.accumulated = 0;
-        stream.last_update = now;
-        if completed {
-            stream.status = StreamStatus::Completed;
-            // Free whatever was reserved but never accrued (paused time).
-            release(&env, stream_id, reserved(&env, stream_id));
-        }
-
-        env.storage()
-            .persistent()
-            .set(&DataKey::Stream(stream_id), &stream);
-
-        env.events()
-            .publish((symbol_short!("s_wdraw"), stream_id), (stream.recipient.clone(), payout));
-        if completed {
-            env.events()
-                .publish((symbol_short!("s_done"), stream_id), stream.recipient);
-        }
+        let payout = settle(&env, stream_id, stream, now)?;
 
         Ok(payout)
+    }
+
+    /// Admin closes an ended stream on the recipient's behalf: pays out
+    /// whatever is still owed (to the recipient, never the admin), marks it
+    /// Completed and releases its remaining reservation. Lets the admin free
+    /// funds held for streams whose recipients never withdraw.
+    ///
+    /// Errors: `StreamNotFound`, `StreamCompleted`, `StreamNotEnded`, `Overflow`.
+    /// Events: as `withdraw`.
+    pub fn close_stream(env: Env, stream_id: u32) -> Result<i128, Error> {
+        admin(&env).require_auth();
+        let stream = load_stream(&env, stream_id)?;
+        if stream.status == StreamStatus::Completed {
+            return Err(Error::StreamCompleted);
+        }
+        let now = env.ledger().timestamp();
+        if now < stream.end_time {
+            return Err(Error::StreamNotEnded);
+        }
+        settle(&env, stream_id, stream, now)
+    }
+
+    /// Admin withdraws tokens that no open stream has reserved (surplus
+    /// funding, or reservations released by completed streams). Can never
+    /// touch funds owed to recipients: `amount` must be ≤ `get_available()`.
+    ///
+    /// Errors: `InvalidAmount`, `InsufficientBalance`.
+    /// Event: `("reclaim", admin)` → `(to, amount)`.
+    pub fn reclaim(env: Env, to: Address, amount: i128) -> Result<(), Error> {
+        let admin = admin(&env);
+        admin.require_auth();
+        if amount <= 0 {
+            return Err(Error::InvalidAmount);
+        }
+        if amount > Self::get_available(env.clone()) {
+            return Err(Error::InsufficientBalance);
+        }
+        let token_addr: Address = env.storage().instance().get(&DataKey::Token).unwrap();
+        token::Client::new(&env, &token_addr).transfer(&env.current_contract_address(), &to, &amount);
+        env.events().publish((symbol_short!("reclaim"), admin), (to, amount));
+        Ok(())
     }
 
     /// Tokens reserved for open streams (funded totals minus payouts).
@@ -841,7 +894,99 @@ mod tests {
         assert_eq!(setup.client.get_available(), RATE * DURATION as i128);
     }
 
+    // ── Reclaim & admin close ────────────────────────────────────────────────
+
     #[test]
+    fn reclaim_withdraws_only_uncommitted_funds() {
+        let env = Env::default();
+        let (setup, _, _) = funded_stream(&env);
+        let full = RATE * DURATION as i128;
+        let treasury = Address::generate(&env);
+        setup.token_admin.mint(&setup.client.address, &500); // surplus
+
+        assert_eq!(setup.client.get_available(), 500);
+        assert_eq!(setup.client.try_reclaim(&treasury, &501), Err(Ok(Error::InsufficientBalance)));
+        setup.client.reclaim(&treasury, &500);
+
+        let (_, topics, data) = env.events().all().last().unwrap();
+        assert_eq!(topics, vec![&env, symbol_short!("reclaim").into_val(&env), setup.admin.into_val(&env)]);
+        let data: (Address, i128) = data.into_val(&env);
+        assert_eq!(data, (treasury.clone(), 500));
+
+        assert_eq!(setup.token.balance(&treasury), 500);
+        assert_eq!(setup.token.balance(&setup.client.address), full, "reserved funds untouched");
+        assert_eq!(setup.client.try_reclaim(&treasury, &1), Err(Ok(Error::InsufficientBalance)));
+    }
+
+    #[test]
+    fn reclaim_rejects_non_positive_amounts_and_requires_admin() {
+        let env = Env::default();
+        let (setup, _, _) = funded_stream(&env);
+        let to = Address::generate(&env);
+        for amount in [0i128, -1, i128::MIN] {
+            assert_eq!(setup.client.try_reclaim(&to, &amount), Err(Ok(Error::InvalidAmount)));
+        }
+        setup.token_admin.mint(&setup.client.address, &10);
+        env.set_auths(&[]);
+        assert!(setup.client.try_reclaim(&to, &10).is_err());
+    }
+
+    #[test]
+    fn released_paused_time_can_be_reclaimed() {
+        let env = Env::default();
+        let (setup, recipient, id) = funded_stream(&env);
+        let treasury = Address::generate(&env);
+
+        at(&env, T0 + 40);
+        setup.client.toggle_stream(&id); // 60s of the reservation will never accrue
+        at(&env, T0 + DURATION);
+        setup.client.withdraw(&id);
+
+        let freed = RATE * (DURATION as i128 - 40);
+        assert_eq!(setup.client.get_available(), freed);
+        setup.client.reclaim(&treasury, &freed);
+        assert_eq!(setup.token.balance(&treasury), freed);
+        assert_eq!(setup.token.balance(&recipient), 40 * RATE);
+        assert_eq!(setup.token.balance(&setup.client.address), 0);
+    }
+
+    #[test]
+    fn admin_close_pays_recipient_and_releases_reservation() {
+        let env = Env::default();
+        let (setup, recipient, id) = funded_stream(&env);
+
+        at(&env, T0 + 30);
+        setup.client.toggle_stream(&id); // paused with 30s owed, recipient never withdraws
+        at(&env, T0 + DURATION + 500);
+
+        assert_eq!(setup.client.close_stream(&id), 30 * RATE);
+        assert_eq!(setup.token.balance(&recipient), 30 * RATE, "owed amount goes to the recipient");
+        assert_eq!(setup.client.get_stream(&id).status, StreamStatus::Completed);
+        assert_eq!(setup.client.get_committed(), 0);
+        assert_eq!(setup.client.get_available(), RATE * (DURATION as i128 - 30));
+        assert_eq!(setup.client.try_close_stream(&id), Err(Ok(Error::StreamCompleted)));
+        assert_eq!(setup.client.try_withdraw(&id), Err(Ok(Error::StreamCompleted)));
+    }
+
+    #[test]
+    fn admin_close_before_end_fails() {
+        let env = Env::default();
+        let (setup, _, id) = funded_stream(&env);
+        at(&env, T0 + DURATION - 1);
+        assert_eq!(setup.client.try_close_stream(&id), Err(Ok(Error::StreamNotEnded)));
+        assert_eq!(setup.client.try_close_stream(&99), Err(Ok(Error::StreamNotFound)));
+    }
+
+    #[test]
+    fn admin_close_requires_admin_auth() {
+        let env = Env::default();
+        let (setup, _, id) = funded_stream(&env);
+        at(&env, T0 + DURATION);
+        env.set_auths(&[]);
+        assert!(setup.client.try_close_stream(&id).is_err());
+    }
+
+        #[test]
     fn unknown_stream_ids_fail() {
         let env = Env::default();
         env.mock_all_auths();
