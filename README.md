@@ -120,7 +120,9 @@ streaming contract
 | `get_accumulated` | — | `stream_id: u32` | `i128` |
 | `withdraw` | `recipient` | `stream_id: u32` | `i128` (amount paid) |
 | `get_stream` | — | `stream_id: u32` | `Stream` |
-| `get_all_streams` | — | — | `Vec<Stream>` |
+| `get_streams` | — | `start: u32`, `limit: u32` (max 50) | `Vec<Stream>` |
+| `get_stream_count` | — | — | `u32` |
+| `get_all_streams` | — | — | `Vec<Stream>` — unbounded, prefer `get_streams` |
 | `get_admin` | — | — | `Address` |
 | `propose_admin` | `admin` | `new_admin: Address` | — |
 | `accept_admin` | nominee | — | — |
@@ -142,7 +144,9 @@ flow_rate = ceil(50_000_000_000 / 2_592_000) = 19_291 stroops/sec
 | `__constructor` | (deploy) | `admin: Address` | — |
 | `register_proof` | `submitter` | `submitter: Address`, `proof_hash: BytesN<32>`, `public_inputs_hash: BytesN<32>`, `proof_type: Symbol` | `u32` (proof ID) |
 | `get_proof` | — | `id: u32` | `ProofEntry` |
-| `get_all_proofs` | — | — | `Vec<ProofEntry>` |
+| `get_proofs` | — | `start: u32`, `limit: u32` (max 50) | `Vec<ProofEntry>` |
+| `get_proof_count` | — | — | `u32` |
+| `get_all_proofs` | — | — | `Vec<ProofEntry>` — unbounded, prefer `get_proofs` |
 | `verify_proof_exists` | — | `proof_hash: BytesN<32>` | `bool` |
 | `get_id_by_hash` | — | `proof_hash: BytesN<32>` | `u32` |
 | `get_proof_by_hash` | — | `proof_hash: BytesN<32>` | `ProofEntry` |

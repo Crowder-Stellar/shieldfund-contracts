@@ -25,6 +25,9 @@ const DAY_IN_LEDGERS: u32 = 17_280; // ~5s ledgers
 const TTL_EXTEND_TO: u32 = 30 * DAY_IN_LEDGERS;
 const TTL_THRESHOLD: u32 = TTL_EXTEND_TO - DAY_IN_LEDGERS;
 
+/// Largest page `get_streams` returns, keeping reads well inside resource limits.
+pub const MAX_PAGE: u32 = 50;
+
 fn bump_instance(env: &Env) {
     env.storage().instance().extend_ttl(TTL_THRESHOLD, TTL_EXTEND_TO);
 }
@@ -285,7 +288,34 @@ impl StreamingContract {
             .expect("stream not found")
     }
 
-    /// Returns all streams (paginate on the frontend if the list grows).
+    /// Returns up to `limit` streams (max `MAX_PAGE`) starting at id `start`,
+    /// in id order. Page through with `start += returned.len()` until
+    /// `start >= get_stream_count()`.
+    pub fn get_streams(env: Env, start: u32, limit: u32) -> Vec<Stream> {
+        let count = Self::get_stream_count(env.clone());
+        let end = start.saturating_add(limit.min(MAX_PAGE)).min(count);
+        let mut streams = Vec::new(&env);
+        for i in start..end {
+            if let Some(s) = env
+                .storage()
+                .persistent()
+                .get::<DataKey, Stream>(&DataKey::Stream(i))
+            {
+                streams.push_back(s);
+            }
+        }
+        streams
+    }
+
+    pub fn get_stream_count(env: Env) -> u32 {
+        env.storage()
+            .persistent()
+            .get(&DataKey::StreamCount)
+            .unwrap_or(0)
+    }
+
+    /// Returns all streams. Unbounded: once there are many streams this
+    /// exceeds per-call resource limits — use `get_streams` instead.
     pub fn get_all_streams(env: Env) -> Vec<Stream> {
         let count: u32 = env
             .storage()
@@ -494,6 +524,22 @@ mod tests {
         assert_eq!(topics, vec![&env, symbol_short!("s_wdraw").into_val(&env), 0u32.into_val(&env)]);
         let (who, paid, status): (Address, i128, StreamStatus) = data.into_val(&env);
         assert_eq!((who, paid, status), (recipient, 1_000, StreamStatus::Paused));
+    }
+
+    #[test]
+    fn streams_page_in_id_order_and_cap_at_max_page() {
+        let env = setup_env();
+        env.ledger().with_mut(|l| l.timestamp = 1_000);
+        let (client, _) = deploy(&env);
+        for _ in 0..55 {
+            client.create_stream(&Address::generate(&env), &1, &2_000);
+        }
+        assert_eq!(client.get_stream_count(), 55);
+        assert_eq!(client.get_streams(&0, &500).len(), MAX_PAGE);
+        let tail = client.get_streams(&50, &50);
+        assert_eq!(tail.len(), 5);
+        assert_eq!(tail.get(0).unwrap().id, 50);
+        assert_eq!(client.get_streams(&u32::MAX, &u32::MAX).len(), 0);
     }
 
     #[test]
