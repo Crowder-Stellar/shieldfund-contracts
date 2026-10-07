@@ -115,11 +115,9 @@ pub struct TreasuryVaultContract;
 
 #[contractimpl]
 impl TreasuryVaultContract {
-    /// One-time setup. Reverts if called again.
-    pub fn initialize(env: Env, admin: Address, usdc_token: Address) {
-        if env.storage().instance().has(&DataKey::Admin) {
-            panic!("already initialized");
-        }
+    /// Runs once, atomically with deployment, so there is no window in which
+    /// someone else could claim the admin role on an uninitialised contract.
+    pub fn __constructor(env: Env, admin: Address, usdc_token: Address) {
         env.storage().instance().set(&DataKey::Admin, &admin);
         env.storage().instance().set(&DataKey::Token, &usdc_token);
         env.storage().persistent().set(&DataKey::TotalRaised, &0i128);
@@ -331,13 +329,11 @@ mod tests {
         let token = TokenClient::new(env, &token_id);
         let token_admin = StellarAssetClient::new(env, &token_id);
 
-        let vault_id = env.register(TreasuryVaultContract, ());
+        let vault_id = env.register(TreasuryVaultContract, (admin.clone(), token_id.clone()));
         let vault = TreasuryVaultContractClient::new(env, &vault_id);
-        vault.initialize(&admin, &token_id);
 
-        let registry_id = env.register(ProofRegistryContract, ());
+        let registry_id = env.register(ProofRegistryContract, (admin.clone(),));
         let registry = proof_registry::ProofRegistryContractClient::new(env, &registry_id);
-        registry.initialize(&admin);
 
         Setup { vault, registry, token, token_admin, admin }
     }
@@ -416,6 +412,28 @@ mod tests {
             &Symbol::new(env, proof_type),
         );
         setup
+    }
+
+    #[test]
+    fn constructor_sets_admin_and_token() {
+        let env = Env::default();
+        let setup = setup(&env);
+        assert_eq!(setup.vault.get_admin(), setup.admin);
+        assert_eq!(setup.vault.get_token(), setup.token.address);
+    }
+
+    #[test]
+    fn there_is_no_initialize_entrypoint_to_front_run() {
+        let env = Env::default();
+        let setup = setup(&env);
+        let attacker = Address::generate(&env);
+        let res = env.try_invoke_contract::<(), soroban_sdk::Error>(
+            &setup.vault.address,
+            &Symbol::new(&env, "initialize"),
+            vec![&env, attacker.into_val(&env), setup.token.address.into_val(&env)],
+        );
+        assert!(res.is_err());
+        assert_eq!(setup.vault.get_admin(), setup.admin);
     }
 
     #[test]

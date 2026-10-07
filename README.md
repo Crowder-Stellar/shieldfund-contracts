@@ -29,7 +29,7 @@ All three contracts are deployed and initialized on **Stellar Testnet** (deploye
 shieldfund-contracts (Cargo workspace)
 │
 ├── treasury_vault          ← Core custody contract
-│   ├── initialize()        one-time setup, sets admin + token SAC
+│   ├── __constructor()     runs at deploy: sets admin + token SAC
 │   ├── deposit()           user → vault token transfer (auth: depositor)
 │   ├── disburse()          vault → recipient, only with an unspent proof for
 │   │                       exactly this recipient + amount (auth: admin)
@@ -41,7 +41,7 @@ shieldfund-contracts (Cargo workspace)
 │   └── transfer_admin()    (auth: current admin)
 │
 ├── streaming               ← Real-time payment engine
-│   ├── initialize()        sets admin + token SAC
+│   ├── __constructor()     runs at deploy: sets admin + token SAC
 │   ├── create_stream()     creates Stream record (auth: admin)
 │   │                       validates contract holds enough tokens first
 │   ├── toggle_stream()     Active ↔ Paused, snapshots accumulated (auth: admin)
@@ -52,7 +52,7 @@ shieldfund-contracts (Cargo workspace)
 │   └── get_admin()
 │
 └── proof_registry          ← ZK proof anchor store
-    ├── initialize()        sets admin
+    ├── __constructor()     runs at deploy: sets admin
     ├── register_proof()    stores ProofEntry + hash index (auth: submitter)
     │                       panics on duplicate hash
     ├── get_proof()         read by sequential ID
@@ -94,7 +94,7 @@ streaming contract
 
 | Function | Auth | Parameters | Returns |
 |----------|------|-----------|---------|
-| `initialize` | — | `admin: Address`, `usdc_token: Address` | — |
+| `__constructor` | (deploy) | `admin: Address`, `usdc_token: Address` | — |
 | `deposit` | `depositor` | `depositor: Address`, `amount: i128` | — |
 | `disburse` | `admin` | `recipient: Address`, `amount: i128`, `proof_hash: BytesN<32>`, `merkle_root: BytesN<32>`, `budget_commitment: BytesN<32>` | — |
 | `is_proof_spent` | — | `proof_hash: BytesN<32>` | `bool` |
@@ -110,7 +110,7 @@ streaming contract
 
 | Function | Auth | Parameters | Returns |
 |----------|------|-----------|---------|
-| `initialize` | — | `admin: Address`, `usdc_token: Address` | — |
+| `__constructor` | (deploy) | `admin: Address`, `usdc_token: Address` | — |
 | `create_stream` | `admin` | `recipient: Address`, `flow_rate_per_second: i128`, `end_time: u64` | `u32` (stream ID) |
 | `toggle_stream` | `admin` | `stream_id: u32` | `StreamStatus` |
 | `get_accumulated` | — | `stream_id: u32` | `i128` |
@@ -130,7 +130,7 @@ flow_rate = ceil(50_000_000_000 / 2_592_000) = 19_291 stroops/sec
 
 | Function | Auth | Parameters | Returns |
 |----------|------|-----------|---------|
-| `initialize` | — | `admin: Address` | — |
+| `__constructor` | (deploy) | `admin: Address` | — |
 | `register_proof` | `submitter` | `submitter: Address`, `proof_hash: BytesN<32>`, `public_inputs_hash: BytesN<32>`, `proof_type: Symbol` | `u32` (proof ID) |
 | `get_proof` | — | `id: u32` | `ProofEntry` |
 | `get_all_proofs` | — | — | `Vec<ProofEntry>` |
@@ -216,8 +216,8 @@ curl "https://friendbot.stellar.org?addr=$(stellar keys address my-admin)"
 stellar contract id asset --asset native --network testnet
 stellar contract alias add xlm_sac --id <XLM_SAC_ID> --network testnet
 
-# 5. Deploy & initialize all 3 contracts
-export ADMIN_ACCOUNT=$(stellar keys address my-admin)
+# 5. Deploy all 3 contracts (constructors set the admin) and wire the vault to the registry
+export ADMIN_ACCOUNT=my-admin   # key name, so the CLI can sign
 chmod +x scripts/deploy-testnet.sh
 ./scripts/deploy-testnet.sh
 
@@ -295,7 +295,7 @@ shieldfund-contracts/
 │                                  # includes #[cfg(test)] suite
 │
 └── scripts/
-    └── deploy-testnet.sh          # Build + deploy + initialize all 3 contracts in one shot
+    └── deploy-testnet.sh          # Build + deploy all 3 contracts + wire vault → registry
 ```
 
 ---
