@@ -1,7 +1,7 @@
 #![no_std]
 use soroban_sdk::{
     contract, contractimpl, contracttype, symbol_short, vec,
-    token, Address, BytesN, Env, IntoVal, Symbol,
+    token, Address, Bytes, BytesN, Env, IntoVal, Symbol, U256,
 };
 
 // ── Storage keys ──────────────────────────────────────────────────────────────
@@ -13,6 +13,86 @@ enum DataKey {
     TotalRaised,
     TotalDisbursed,
     ProofRegistry,
+    // A proof_hash that has already paid out — each proof is single-use.
+    SpentProof(BytesN<32>),
+}
+
+/// Mirror of proof_registry's `ProofEntry`, decoded from the cross-contract
+/// call in `disburse`. Field names and types must match exactly.
+#[contracttype]
+#[derive(Clone, Debug)]
+pub struct ProofEntry {
+    pub id: u32,
+    pub proof_hash: BytesN<32>,
+    pub public_inputs_hash: BytesN<32>,
+    pub proof_type: Symbol,
+    pub timestamp: u64,
+    pub submitter: Address,
+}
+
+/// BN254 scalar field modulus (big-endian). Every public input of the
+/// payroll_compliance circuit is an element of this field.
+const FIELD_MODULUS: [u8; 32] = [
+    0x30, 0x64, 0x4e, 0x72, 0xe1, 0x31, 0xa0, 0x29, 0xb8, 0x50, 0x45, 0xb6, 0x81, 0x81, 0x58, 0x5d,
+    0x28, 0x33, 0xe8, 0x48, 0x79, 0xb9, 0x70, 0x91, 0x43, 0xe1, 0xf5, 0x93, 0xf0, 0x00, 0x00, 0x01,
+];
+
+/// Maps a proof_registry `proof_type` Symbol to the circuit's
+/// `proof_type_id` (0 = payroll, 1 = operational, 2 = relief).
+fn proof_type_id(env: &Env, proof_type: &Symbol) -> u32 {
+    if *proof_type == Symbol::new(env, "payroll") {
+        0
+    } else if *proof_type == Symbol::new(env, "operational") {
+        1
+    } else if *proof_type == Symbol::new(env, "relief") {
+        2
+    } else {
+        panic!("unknown proof_type")
+    }
+}
+
+/// The circuit's `recipient_id` for a Stellar address: keccak256 of the
+/// strkey's UTF-8 bytes, reduced into the field. Matches
+/// `addressToField()` in shieldfund-proof-server/src/hash.js.
+fn recipient_field(env: &Env, recipient: &Address) -> BytesN<32> {
+    let strkey = recipient.to_string();
+    let mut buf = [0u8; 56];
+    assert!(strkey.len() as usize == buf.len(), "unexpected address length");
+    strkey.copy_into_slice(&mut buf);
+    let digest: Bytes = env.crypto().keccak256(&Bytes::from_slice(env, &buf)).into();
+    let modulus = U256::from_be_bytes(env, &Bytes::from_array(env, &FIELD_MODULUS));
+    field_bytes(env, &U256::from_be_bytes(env, &digest).rem_euclid(&modulus))
+}
+
+fn field_bytes(env: &Env, value: &U256) -> BytesN<32> {
+    let raw = value.to_be_bytes();
+    let mut out = [0u8; 32];
+    let offset = 32 - raw.len() as usize;
+    for (i, b) in raw.iter().enumerate() {
+        out[offset + i] = b;
+    }
+    BytesN::from_array(env, &out)
+}
+
+/// keccak256 over the circuit's public inputs in declaration order, each as
+/// a 32-byte big-endian field element. Matches `hashPublicInputs()` in
+/// shieldfund-proof-server/src/hash.js, so it equals the `public_inputs_hash`
+/// the proof server returns for a proof of exactly this payment.
+fn public_inputs_hash(
+    env: &Env,
+    merkle_root: &BytesN<32>,
+    budget_commitment: &BytesN<32>,
+    recipient: &Address,
+    amount: i128,
+    proof_type_id: u32,
+) -> BytesN<32> {
+    let mut data = Bytes::new(env);
+    data.append(&merkle_root.clone().into());
+    data.append(&budget_commitment.clone().into());
+    data.append(&recipient_field(env, recipient).into());
+    data.append(&field_bytes(env, &U256::from_u128(env, amount as u128)).into());
+    data.append(&field_bytes(env, &U256::from_u32(env, proof_type_id)).into());
+    env.crypto().keccak256(&data).into()
 }
 
 // ── Public types (returned to callers) ───────────────────────────────────────
@@ -98,15 +178,22 @@ impl TreasuryVaultContract {
 
     /// Admin-only: disburse USDC to a recipient.
     ///
-    /// `proof_hash` must already be registered in ProofRegistry — this is
-    /// what makes the disbursement actually ZK-gated rather than just
-    /// carrying a hash nobody checks. Panics if the registry hasn't been
-    /// configured via `set_proof_registry`, or if the hash isn't found.
+    /// `proof_hash` must be registered in ProofRegistry, and the proof must be
+    /// *for this exact payment*: its registered `public_inputs_hash` has to
+    /// equal the hash recomputed here from `merkle_root`, `budget_commitment`,
+    /// `recipient`, `amount` and the registered proof type. Each proof pays
+    /// out at most once.
+    ///
+    /// `amount` is in token stroops and must be the same value the proof was
+    /// generated for. `merkle_root` / `budget_commitment` are returned by the
+    /// proof server alongside `proof_hash`.
     pub fn disburse(
         env: Env,
         recipient: Address,
         amount: i128,
         proof_hash: BytesN<32>,
+        merkle_root: BytesN<32>,
+        budget_commitment: BytesN<32>,
     ) {
         let admin: Address = env.storage().instance().get(&DataKey::Admin).unwrap();
         admin.require_auth();
@@ -123,6 +210,31 @@ impl TreasuryVaultContract {
             vec![&env, proof_hash.into_val(&env)],
         );
         assert!(proof_exists, "proof_hash not registered in proof_registry");
+
+        let spent_key = DataKey::SpentProof(proof_hash.clone());
+        assert!(
+            !env.storage().persistent().has(&spent_key),
+            "proof already used for a disbursement"
+        );
+
+        let entry: ProofEntry = env.invoke_contract(
+            &registry,
+            &Symbol::new(&env, "get_proof_by_hash"),
+            vec![&env, proof_hash.into_val(&env)],
+        );
+        let expected = public_inputs_hash(
+            &env,
+            &merkle_root,
+            &budget_commitment,
+            &recipient,
+            amount,
+            proof_type_id(&env, &entry.proof_type),
+        );
+        assert!(
+            entry.public_inputs_hash == expected,
+            "proof does not match this recipient and amount"
+        );
+        env.storage().persistent().set(&spent_key, &true);
 
         let token_addr: Address = env.storage().instance().get(&DataKey::Token).unwrap();
         let token_client = token::Client::new(&env, &token_addr);
@@ -171,6 +283,11 @@ impl TreasuryVaultContract {
                 .get(&DataKey::TotalDisbursed)
                 .unwrap_or(0),
         }
+    }
+
+    /// True if this proof has already paid out a disbursement.
+    pub fn is_proof_spent(env: Env, proof_hash: BytesN<32>) -> bool {
+        env.storage().persistent().has(&DataKey::SpentProof(proof_hash))
     }
 
     pub fn get_admin(env: Env) -> Address {
@@ -235,6 +352,91 @@ mod tests {
         BytesN::from_array(env, &[byte; 32])
     }
 
+    fn hex32(env: &Env, hex: &str) -> BytesN<32> {
+        let mut out = [0u8; 32];
+        for i in 0..32 {
+            out[i] = u8::from_str_radix(&hex[2 + 2 * i..4 + 2 * i], 16).unwrap();
+        }
+        BytesN::from_array(env, &out)
+    }
+
+    // Test vectors produced by shieldfund-proof-server/src/hash.js
+    // (hashPublicInputs / addressToField) for merkle_root = 0x11..11 and
+    // budget_commitment = 0x22..22.
+    //
+    // A G... account recipient, checked against the hashing helpers only.
+    const G_RECIPIENT: &str = "GBJ5FP5UB4YUE2EONTPPSAGKZZGDETFZLEJXJRCALSYTJZIDVWAN3C7P";
+    const G_RECIPIENT_FIELD: &str =
+        "0x1f5e152d8c3ea3c53910a0328b35a2ea0408937977bb10bde7562f287a1e3ed9";
+    const G_PIH_500000_PAYROLL: &str =
+        "0x1cd7ebfee1f402d0f5be4b37d05c8f853433807e8e90cfba4fe01cdfff805209";
+    const G_PIH_500000_OPERATIONAL: &str =
+        "0x468a2b56bd5a4f70a80bf2869af69da57612ef06169f08ff3d78eeb98936bca9";
+    const G_PIH_499999_PAYROLL: &str =
+        "0x5eec4cb1810118d05243ebdb6280e6e13ef13a666307c2d8be2b68f67cdff343";
+
+    // A C... contract recipient used for end-to-end disbursements: contract
+    // addresses hold the test token without needing a trustline.
+    const RECIPIENT: &str = "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAD2KM";
+    const RECIPIENT_FIELD: &str =
+        "0x1e9e09bf34d76d67afec2e73d8081a51376776fa9e04442261295d959c5ce033";
+    const PIH_500000_PAYROLL: &str =
+        "0xf19de4ca84abbed9f1bdd02b7ce2952da7a7ad598530fae7c48ec72c7c3f0b86";
+    const PIH_500000_OPERATIONAL: &str =
+        "0xe910f2502d7cd10d2510eac5dcfd2f970b5ad51151c3ebc3e658d7ae72fecb62";
+    const PIH_499999_PAYROLL: &str =
+        "0xf5d1987289f0e2e656ab3f2f7ad45db4d393499634383d8588dcbdecff62d796";
+
+    fn address(env: &Env, strkey: &str) -> Address {
+        Address::from_string(&soroban_sdk::String::from_str(env, strkey))
+    }
+
+    fn recipient(env: &Env) -> Address {
+        address(env, RECIPIENT)
+    }
+
+    fn root(env: &Env) -> BytesN<32> {
+        some_hash(env, 0x11)
+    }
+
+    fn commitment(env: &Env) -> BytesN<32> {
+        some_hash(env, 0x22)
+    }
+
+    /// Funds the vault, wires the registry, and registers proof `hash` with
+    /// the given public-inputs hash and proof type.
+    fn ready<'a>(env: &'a Env, hash: &BytesN<32>, pih: &str, proof_type: &str) -> Setup<'a> {
+        let setup = setup(env);
+        fund_vault(env, &setup, 1_000_000);
+        setup.vault.set_proof_registry(&setup.registry.address);
+        setup.registry.register_proof(
+            &setup.admin,
+            hash,
+            &hex32(env, pih),
+            &Symbol::new(env, proof_type),
+        );
+        setup
+    }
+
+    #[test]
+    fn hashing_matches_proof_server() {
+        let env = Env::default();
+        let cases = [
+            (G_RECIPIENT, G_RECIPIENT_FIELD, [G_PIH_500000_PAYROLL, G_PIH_500000_OPERATIONAL, G_PIH_499999_PAYROLL]),
+            (RECIPIENT, RECIPIENT_FIELD, [PIH_500000_PAYROLL, PIH_500000_OPERATIONAL, PIH_499999_PAYROLL]),
+        ];
+        for (strkey, field, [payroll, operational, smaller]) in cases {
+            let who = address(&env, strkey);
+            assert_eq!(recipient_field(&env, &who), hex32(&env, field));
+            let pih = |amount: i128, pt: u32| {
+                public_inputs_hash(&env, &root(&env), &commitment(&env), &who, amount, pt)
+            };
+            assert_eq!(pih(500_000, 0), hex32(&env, payroll));
+            assert_eq!(pih(500_000, 1), hex32(&env, operational));
+            assert_eq!(pih(499_999, 0), hex32(&env, smaller));
+        }
+    }
+
     #[test]
     #[should_panic(expected = "proof registry not configured")]
     fn disburse_without_registry_configured_panics() {
@@ -243,8 +445,7 @@ mod tests {
         let setup = setup(&env);
         fund_vault(&env, &setup, 1_000_000);
 
-        let recipient = Address::generate(&env);
-        setup.vault.disburse(&recipient, &500_000, &some_hash(&env, 1));
+        setup.vault.disburse(&recipient(&env), &500_000, &some_hash(&env, 1), &root(&env), &commitment(&env));
     }
 
     #[test]
@@ -256,31 +457,93 @@ mod tests {
         fund_vault(&env, &setup, 1_000_000);
         setup.vault.set_proof_registry(&setup.registry.address);
 
-        let recipient = Address::generate(&env);
-        setup.vault.disburse(&recipient, &500_000, &some_hash(&env, 1));
+        setup.vault.disburse(&recipient(&env), &500_000, &some_hash(&env, 1), &root(&env), &commitment(&env));
     }
 
     #[test]
-    fn disburse_with_registered_proof_succeeds() {
+    fn disburse_with_matching_proof_succeeds() {
         let env = Env::default();
         env.mock_all_auths();
-        let setup = setup(&env);
-        fund_vault(&env, &setup, 1_000_000);
-        setup.vault.set_proof_registry(&setup.registry.address);
-
         let hash = some_hash(&env, 1);
-        let inputs_hash = some_hash(&env, 2);
-        setup.registry.register_proof(
-            &setup.admin,
-            &hash,
-            &inputs_hash,
-            &Symbol::new(&env, "payroll"),
-        );
+        let setup = ready(&env, &hash, PIH_500000_PAYROLL, "payroll");
 
-        let recipient = Address::generate(&env);
-        setup.vault.disburse(&recipient, &500_000, &hash);
+        assert!(!setup.vault.is_proof_spent(&hash));
+        setup.vault.disburse(&recipient(&env), &500_000, &hash, &root(&env), &commitment(&env));
 
-        assert_eq!(setup.token.balance(&recipient), 500_000);
+        assert_eq!(setup.token.balance(&recipient(&env)), 500_000);
         assert_eq!(setup.vault.get_stats().total_disbursed, 500_000);
+        assert!(setup.vault.is_proof_spent(&hash));
+    }
+
+    #[test]
+    #[should_panic(expected = "proof already used for a disbursement")]
+    fn replaying_a_proof_panics() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let hash = some_hash(&env, 1);
+        let setup = ready(&env, &hash, PIH_500000_PAYROLL, "payroll");
+
+        setup.vault.disburse(&recipient(&env), &500_000, &hash, &root(&env), &commitment(&env));
+        setup.vault.disburse(&recipient(&env), &500_000, &hash, &root(&env), &commitment(&env));
+    }
+
+    #[test]
+    #[should_panic(expected = "proof does not match this recipient and amount")]
+    fn wrong_amount_panics() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let hash = some_hash(&env, 1);
+        let setup = ready(&env, &hash, PIH_499999_PAYROLL, "payroll");
+
+        setup.vault.disburse(&recipient(&env), &500_000, &hash, &root(&env), &commitment(&env));
+    }
+
+    #[test]
+    #[should_panic(expected = "proof does not match this recipient and amount")]
+    fn wrong_recipient_panics() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let hash = some_hash(&env, 1);
+        let setup = ready(&env, &hash, PIH_500000_PAYROLL, "payroll");
+
+        setup.vault.disburse(&address(&env, G_RECIPIENT), &500_000, &hash, &root(&env), &commitment(&env));
+    }
+
+    #[test]
+    #[should_panic(expected = "proof does not match this recipient and amount")]
+    fn wrong_proof_type_panics() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let hash = some_hash(&env, 1);
+        // Hash was computed for "operational" but the proof is registered as "payroll".
+        let setup = ready(&env, &hash, PIH_500000_OPERATIONAL, "payroll");
+
+        setup.vault.disburse(&recipient(&env), &500_000, &hash, &root(&env), &commitment(&env));
+    }
+
+    #[test]
+    #[should_panic(expected = "proof does not match this recipient and amount")]
+    fn wrong_merkle_root_panics() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let hash = some_hash(&env, 1);
+        let setup = ready(&env, &hash, PIH_500000_PAYROLL, "payroll");
+
+        setup.vault.disburse(&recipient(&env), &500_000, &hash, &some_hash(&env, 0x33), &commitment(&env));
+    }
+
+    #[test]
+    fn a_failed_attempt_does_not_burn_the_proof() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let hash = some_hash(&env, 1);
+        let setup = ready(&env, &hash, PIH_500000_PAYROLL, "payroll");
+
+        let bad = setup.vault.try_disburse(&recipient(&env), &499_999, &hash, &root(&env), &commitment(&env));
+        assert!(bad.is_err());
+        assert!(!setup.vault.is_proof_spent(&hash));
+
+        setup.vault.disburse(&recipient(&env), &500_000, &hash, &root(&env), &commitment(&env));
+        assert_eq!(setup.token.balance(&recipient(&env)), 500_000);
     }
 }

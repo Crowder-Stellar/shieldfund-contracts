@@ -160,6 +160,14 @@ impl ProofRegistryContract {
             .expect("proof not found")
     }
 
+    /// Returns the full entry for a given proof hash, or panics if not found.
+    /// treasury_vault::disburse() uses this to check the registered
+    /// public_inputs_hash and proof_type against the payment it's making.
+    pub fn get_proof_by_hash(env: Env, proof_hash: BytesN<32>) -> ProofEntry {
+        let id = Self::get_id_by_hash(env.clone(), proof_hash);
+        Self::get_proof(env, id)
+    }
+
     pub fn get_admin(env: Env) -> Address {
         env.storage().instance().get(&DataKey::Admin).unwrap()
     }
@@ -263,5 +271,29 @@ mod tests {
         assert_eq!(id0, 0);
         assert_eq!(id1, 1);
         assert_eq!(client.get_all_proofs().len(), 2);
+    }
+
+    #[test]
+    fn get_proof_by_hash_returns_registered_entry() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (client, admin) = deploy(&env);
+
+        let pt = Symbol::new(&env, "relief");
+        client.register_proof(&admin, &zero_hash(&env), &zero_hash(&env), &pt);
+        client.register_proof(&admin, &one_hash(&env), &zero_hash(&env), &pt);
+
+        let entry = client.get_proof_by_hash(&one_hash(&env));
+        assert_eq!(entry.id, 1);
+        assert_eq!(entry.proof_hash, one_hash(&env));
+        assert_eq!(entry.proof_type, pt);
+    }
+
+    #[test]
+    #[should_panic(expected = "proof not found")]
+    fn get_proof_by_hash_unknown_panics() {
+        let env = Env::default();
+        let (client, _) = deploy(&env);
+        client.get_proof_by_hash(&one_hash(&env));
     }
 }

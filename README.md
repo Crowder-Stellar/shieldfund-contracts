@@ -31,7 +31,9 @@ shieldfund-contracts (Cargo workspace)
 ├── treasury_vault          ← Core custody contract
 │   ├── initialize()        one-time setup, sets admin + token SAC
 │   ├── deposit()           user → vault token transfer (auth: depositor)
-│   ├── disburse()          vault → recipient + ZK proof anchor (auth: admin)
+│   ├── disburse()          vault → recipient, only with an unspent proof for
+│   │                       exactly this recipient + amount (auth: admin)
+│   ├── is_proof_spent()    read-only: has this proof already paid out?
 │   ├── get_balance()       read-only: live vault token balance
 │   ├── get_stats()         read-only: { vault_balance, total_raised, total_disbursed }
 │   ├── get_admin()
@@ -57,6 +59,7 @@ shieldfund-contracts (Cargo workspace)
     ├── get_all_proofs()    read all ProofEntry records
     ├── verify_proof_exists() bool check by hash (O(1))
     ├── get_id_by_hash()    reverse lookup: hash → id
+    ├── get_proof_by_hash() full ProofEntry by hash
     ├── get_admin()
     └── transfer_admin()    (auth: current admin)
 ```
@@ -71,7 +74,9 @@ User (Freighter wallet)
     └─ register_proof() ──────────► proof_registry
                                           │ proof_hash stored
                                           │
-treasury_vault::disburse(proof_hash) ─────┘ (admin links payment to proof)
+treasury_vault::disburse(proof_hash, ...) ┘ (recomputes the public-inputs hash for
+    │                                       this recipient + amount, checks it
+    │                                       matches, marks the proof spent)
     │
     └─► transfers tokens to recipient
 
@@ -91,7 +96,8 @@ streaming contract
 |----------|------|-----------|---------|
 | `initialize` | — | `admin: Address`, `usdc_token: Address` | — |
 | `deposit` | `depositor` | `depositor: Address`, `amount: i128` | — |
-| `disburse` | `admin` | `recipient: Address`, `amount: i128`, `proof_hash: BytesN<32>` | — |
+| `disburse` | `admin` | `recipient: Address`, `amount: i128`, `proof_hash: BytesN<32>`, `merkle_root: BytesN<32>`, `budget_commitment: BytesN<32>` | — |
+| `is_proof_spent` | — | `proof_hash: BytesN<32>` | `bool` |
 | `get_balance` | — | — | `i128` |
 | `get_stats` | — | — | `VaultStats` |
 | `get_admin` | — | — | `Address` |
@@ -130,12 +136,32 @@ flow_rate = ceil(50_000_000_000 / 2_592_000) = 19_291 stroops/sec
 | `get_all_proofs` | — | — | `Vec<ProofEntry>` |
 | `verify_proof_exists` | — | `proof_hash: BytesN<32>` | `bool` |
 | `get_id_by_hash` | — | `proof_hash: BytesN<32>` | `u32` |
+| `get_proof_by_hash` | — | `proof_hash: BytesN<32>` | `ProofEntry` |
 | `get_admin` | — | — | `Address` |
 | `transfer_admin` | `admin` | `new_admin: Address` | — |
 
 `proof_type` is a Soroban `Symbol` (max 9 chars): `"payroll"`, `"operational"`, `"relief"`.
 
 ---
+
+### How `disburse` checks a proof
+
+A registered proof only authorises the one payment it was generated for:
+
+1. The vault reads the proof's `ProofEntry` from `proof_registry`.
+2. It recomputes the public-inputs hash for this payment: keccak256 over
+   `merkle_root`, `budget_commitment`, `recipient_id`, `amount` and `proof_type_id`,
+   each as a 32-byte big-endian field element. `recipient_id` is keccak256 of the
+   recipient's strkey reduced into the BN254 field. This is byte-for-byte what
+   `hashPublicInputs()` / `addressToField()` in `shieldfund-proof-server` compute.
+3. The result must equal the registered `public_inputs_hash`, otherwise the call
+   fails with `proof does not match this recipient and amount`.
+4. The proof is marked spent, so a second `disburse` with it fails with
+   `proof already used for a disbursement`.
+
+`amount` must be in token stroops — the same value the proof was generated for.
+`merkle_root` and `budget_commitment` come back from the proof server's `/api/prove`
+response alongside `proof_hash`.
 
 ## Prerequisites
 
