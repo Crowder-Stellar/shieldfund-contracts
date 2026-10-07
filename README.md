@@ -98,6 +98,7 @@ streaming contract
 | `deposit` | `depositor` | `depositor: Address`, `amount: i128` | — |
 | `disburse` | `admin` | `recipient: Address`, `amount: i128`, `proof_hash: BytesN<32>`, `merkle_root: BytesN<32>`, `budget_commitment: BytesN<32>` | — |
 | `is_proof_spent` | — | `proof_hash: BytesN<32>` | `bool` |
+| `extend_ttl` | — | — | — |
 | `get_balance` | — | — | `i128` |
 | `get_stats` | — | — | `VaultStats` |
 | `get_admin` | — | — | `Address` |
@@ -118,6 +119,7 @@ streaming contract
 | `get_stream` | — | `stream_id: u32` | `Stream` |
 | `get_all_streams` | — | — | `Vec<Stream>` |
 | `get_admin` | — | — | `Address` |
+| `extend_ttl` | — | `stream_id: u32` | — |
 
 **Flow rate formula:** `flow_rate_per_second = ceil(monthly_amount_stroops / 2_592_000)`
 
@@ -137,6 +139,7 @@ flow_rate = ceil(50_000_000_000 / 2_592_000) = 19_291 stroops/sec
 | `verify_proof_exists` | — | `proof_hash: BytesN<32>` | `bool` |
 | `get_id_by_hash` | — | `proof_hash: BytesN<32>` | `u32` |
 | `get_proof_by_hash` | — | `proof_hash: BytesN<32>` | `ProofEntry` |
+| `extend_ttl` | — | `id: u32` | — |
 | `get_admin` | — | — | `Address` |
 | `transfer_admin` | `admin` | `new_admin: Address` | — |
 
@@ -162,6 +165,24 @@ A registered proof only authorises the one payment it was generated for:
 `amount` must be in token stroops — the same value the proof was generated for.
 `merkle_root` and `budget_commitment` come back from the proof server's `/api/prove`
 response alongside `proof_hash`.
+
+### Storage TTL
+
+Soroban archives storage entries whose TTL runs out. Every contract call bumps the
+contract instance (admin, token, wiring) to 30 days, and every proof, stream, spent
+marker and running total is bumped to 30 days when it's written or used.
+
+Anything that sits untouched for a month — an old proof, an idle stream — can be kept
+alive by **anyone** with `extend_ttl` (it changes no data, so it needs no auth):
+
+```bash
+stellar contract invoke --id <PROOF_REGISTRY> --source <any-key> --network testnet --send=yes -- extend_ttl --id <proof_id>
+stellar contract invoke --id <STREAMING>      --source <any-key> --network testnet --send=yes -- extend_ttl --stream_id <id>
+stellar contract invoke --id <TREASURY_VAULT> --source <any-key> --network testnet --send=yes -- extend_ttl
+```
+
+`--send=yes` is needed because the CLI otherwise treats a call with no data writes as
+read-only and only simulates it.
 
 ## Prerequisites
 

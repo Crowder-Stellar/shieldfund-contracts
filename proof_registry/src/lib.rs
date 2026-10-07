@@ -1,7 +1,7 @@
 #![no_std]
 use soroban_sdk::{
     contract, contractimpl, contracttype, symbol_short,
-    Address, BytesN, Env, Symbol, Vec,
+    Address, BytesN, Env, IntoVal, Symbol, Val, Vec,
 };
 
 // ── Storage keys ──────────────────────────────────────────────────────────────
@@ -13,6 +13,24 @@ enum DataKey {
     Proof(u32),
     // Secondary index: proof_hash → proof id, for existence checks.
     HashIndex(BytesN<32>),
+}
+
+// ── Storage TTL ──────────────────────────────────────────────────────────────
+//
+// Soroban archives entries whose TTL runs out. Instance storage (admin, token,
+// wiring) is bumped on every call; persistent entries are bumped whenever they
+// are written or used, and anyone can bump them explicitly via `extend_ttl`.
+
+const DAY_IN_LEDGERS: u32 = 17_280; // ~5s ledgers
+const TTL_EXTEND_TO: u32 = 30 * DAY_IN_LEDGERS;
+const TTL_THRESHOLD: u32 = TTL_EXTEND_TO - DAY_IN_LEDGERS;
+
+fn bump_instance(env: &Env) {
+    env.storage().instance().extend_ttl(TTL_THRESHOLD, TTL_EXTEND_TO);
+}
+
+fn bump<K: IntoVal<Env, Val>>(env: &Env, key: &K) {
+    env.storage().persistent().extend_ttl(key, TTL_THRESHOLD, TTL_EXTEND_TO);
 }
 
 // ── Public types ─────────────────────────────────────────────────────────────
@@ -50,6 +68,8 @@ impl ProofRegistryContract {
     pub fn __constructor(env: Env, admin: Address) {
         env.storage().instance().set(&DataKey::Admin, &admin);
         env.storage().persistent().set(&DataKey::ProofCount, &0u32);
+        bump_instance(&env);
+        bump(&env, &DataKey::ProofCount);
     }
 
     /// Register a ZK proof on-chain.
@@ -69,6 +89,7 @@ impl ProofRegistryContract {
         proof_type: Symbol,
     ) -> u32 {
         submitter.require_auth();
+        bump_instance(&env);
 
         let admin: Address = env.storage().instance().get(&DataKey::Admin).unwrap();
         assert!(submitter == admin, "only admin may submit proofs");
@@ -105,6 +126,9 @@ impl ProofRegistryContract {
         env.storage()
             .persistent()
             .set(&DataKey::ProofCount, &(id + 1));
+        bump(&env, &DataKey::Proof(id));
+        bump(&env, &DataKey::HashIndex(proof_hash.clone()));
+        bump(&env, &DataKey::ProofCount);
 
         env.events().publish(
             (symbol_short!("p_reg"), submitter),
@@ -146,9 +170,13 @@ impl ProofRegistryContract {
     /// Useful for quick on-chain existence checks from the frontend or other
     /// contracts (e.g. vault.disburse can optionally call this before paying).
     pub fn verify_proof_exists(env: Env, proof_hash: BytesN<32>) -> bool {
-        env.storage()
-            .persistent()
-            .has(&DataKey::HashIndex(proof_hash))
+        bump_instance(&env);
+        let key = DataKey::HashIndex(proof_hash);
+        let exists = env.storage().persistent().has(&key);
+        if exists {
+            bump(&env, &key);
+        }
+        exists
     }
 
     /// Returns the proof ID for a given hash, or panics if not found.
@@ -164,7 +192,18 @@ impl ProofRegistryContract {
     /// public_inputs_hash and proof_type against the payment it's making.
     pub fn get_proof_by_hash(env: Env, proof_hash: BytesN<32>) -> ProofEntry {
         let id = Self::get_id_by_hash(env.clone(), proof_hash);
+        bump(&env, &DataKey::Proof(id));
         Self::get_proof(env, id)
+    }
+
+    /// Keeps a proof's entries (and the contract instance) alive. Anyone may
+    /// call this; it only extends TTLs, it changes no data.
+    pub fn extend_ttl(env: Env, id: u32) {
+        bump_instance(&env);
+        bump(&env, &DataKey::ProofCount);
+        let entry = Self::get_proof(env.clone(), id);
+        bump(&env, &DataKey::Proof(id));
+        bump(&env, &DataKey::HashIndex(entry.proof_hash));
     }
 
     pub fn get_admin(env: Env) -> Address {
@@ -174,6 +213,7 @@ impl ProofRegistryContract {
     pub fn transfer_admin(env: Env, new_admin: Address) {
         let admin: Address = env.storage().instance().get(&DataKey::Admin).unwrap();
         admin.require_auth();
+        bump_instance(&env);
         env.storage().instance().set(&DataKey::Admin, &new_admin);
     }
 }
@@ -182,7 +222,7 @@ impl ProofRegistryContract {
 mod tests {
     use super::*;
     use soroban_sdk::{
-        testutils::Address as _,
+        testutils::{storage::{Instance as _, Persistent as _}, Address as _, Ledger},
         BytesN, Env, IntoVal, Symbol,
     };
 
@@ -269,6 +309,68 @@ mod tests {
         assert_eq!(id0, 0);
         assert_eq!(id1, 1);
         assert_eq!(client.get_all_proofs().len(), 2);
+    }
+
+    fn ttl(env: &Env, contract: &Address, key: &DataKey) -> u32 {
+        env.as_contract(contract, || env.storage().persistent().get_ttl(key))
+    }
+
+    fn instance_ttl(env: &Env, contract: &Address) -> u32 {
+        env.as_contract(contract, || env.storage().instance().get_ttl())
+    }
+
+    fn advance_days(env: &Env, days: u32) {
+        env.ledger().with_mut(|l| l.sequence_number += days * DAY_IN_LEDGERS);
+    }
+
+    #[test]
+    fn registered_proof_gets_a_long_ttl() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (client, admin) = deploy(&env);
+        client.register_proof(&admin, &one_hash(&env), &zero_hash(&env), &Symbol::new(&env, "payroll"));
+
+        let id = &client.address;
+        assert_eq!(ttl(&env, id, &DataKey::Proof(0)), TTL_EXTEND_TO);
+        assert_eq!(ttl(&env, id, &DataKey::HashIndex(one_hash(&env))), TTL_EXTEND_TO);
+        assert_eq!(ttl(&env, id, &DataKey::ProofCount), TTL_EXTEND_TO);
+        assert_eq!(instance_ttl(&env, id), TTL_EXTEND_TO);
+    }
+
+    #[test]
+    fn using_a_proof_renews_its_ttl() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (client, admin) = deploy(&env);
+        client.register_proof(&admin, &one_hash(&env), &zero_hash(&env), &Symbol::new(&env, "payroll"));
+
+        // Well past the network's default TTL, still inside ours.
+        advance_days(&env, 20);
+        assert!(client.verify_proof_exists(&one_hash(&env)));
+        client.get_proof_by_hash(&one_hash(&env));
+
+        let id = &client.address;
+        assert_eq!(ttl(&env, id, &DataKey::Proof(0)), TTL_EXTEND_TO);
+        assert_eq!(ttl(&env, id, &DataKey::HashIndex(one_hash(&env))), TTL_EXTEND_TO);
+        assert_eq!(instance_ttl(&env, id), TTL_EXTEND_TO);
+    }
+
+    #[test]
+    fn anyone_can_extend_a_proofs_ttl() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (client, admin) = deploy(&env);
+        client.register_proof(&admin, &one_hash(&env), &zero_hash(&env), &Symbol::new(&env, "payroll"));
+        advance_days(&env, 20);
+
+        // No auth needed: drop the mocked auths before calling.
+        env.set_auths(&[]);
+        client.extend_ttl(&0);
+
+        let id = &client.address;
+        assert_eq!(ttl(&env, id, &DataKey::Proof(0)), TTL_EXTEND_TO);
+        assert_eq!(ttl(&env, id, &DataKey::HashIndex(one_hash(&env))), TTL_EXTEND_TO);
+        assert_eq!(ttl(&env, id, &DataKey::ProofCount), TTL_EXTEND_TO);
     }
 
     #[test]

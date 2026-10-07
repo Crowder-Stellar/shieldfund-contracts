@@ -1,7 +1,7 @@
 #![no_std]
 use soroban_sdk::{
     contract, contractimpl, contracttype, symbol_short,
-    token, Address, Env, Vec,
+    token, Address, Env, IntoVal, Val, Vec,
 };
 
 // ── Storage keys ──────────────────────────────────────────────────────────────
@@ -12,6 +12,24 @@ enum DataKey {
     Token,
     StreamCount,
     Stream(u32),
+}
+
+// ── Storage TTL ──────────────────────────────────────────────────────────────
+//
+// Soroban archives entries whose TTL runs out. Instance storage (admin, token,
+// wiring) is bumped on every call; persistent entries are bumped whenever they
+// are written or used, and anyone can bump them explicitly via `extend_ttl`.
+
+const DAY_IN_LEDGERS: u32 = 17_280; // ~5s ledgers
+const TTL_EXTEND_TO: u32 = 30 * DAY_IN_LEDGERS;
+const TTL_THRESHOLD: u32 = TTL_EXTEND_TO - DAY_IN_LEDGERS;
+
+fn bump_instance(env: &Env) {
+    env.storage().instance().extend_ttl(TTL_THRESHOLD, TTL_EXTEND_TO);
+}
+
+fn bump<K: IntoVal<Env, Val>>(env: &Env, key: &K) {
+    env.storage().persistent().extend_ttl(key, TTL_THRESHOLD, TTL_EXTEND_TO);
 }
 
 // ── Public types ─────────────────────────────────────────────────────────────
@@ -57,6 +75,8 @@ impl StreamingContract {
         env.storage().instance().set(&DataKey::Admin, &admin);
         env.storage().instance().set(&DataKey::Token, &usdc_token);
         env.storage().persistent().set(&DataKey::StreamCount, &0u32);
+        bump_instance(&env);
+        bump(&env, &DataKey::StreamCount);
     }
 
     /// Admin creates a new payment stream.
@@ -76,6 +96,7 @@ impl StreamingContract {
     ) -> u32 {
         let admin: Address = env.storage().instance().get(&DataKey::Admin).unwrap();
         admin.require_auth();
+        bump_instance(&env);
 
         assert!(flow_rate_per_second > 0, "flow rate must be positive");
 
@@ -115,6 +136,8 @@ impl StreamingContract {
         env.storage()
             .persistent()
             .set(&DataKey::StreamCount, &(id + 1));
+        bump(&env, &DataKey::Stream(id));
+        bump(&env, &DataKey::StreamCount);
 
         env.events().publish(
             (symbol_short!("s_create"), recipient),
@@ -133,6 +156,7 @@ impl StreamingContract {
     pub fn toggle_stream(env: Env, stream_id: u32) -> StreamStatus {
         let admin: Address = env.storage().instance().get(&DataKey::Admin).unwrap();
         admin.require_auth();
+        bump_instance(&env);
 
         let mut stream: Stream = env
             .storage()
@@ -161,6 +185,7 @@ impl StreamingContract {
         env.storage()
             .persistent()
             .set(&DataKey::Stream(stream_id), &stream);
+        bump(&env, &DataKey::Stream(stream_id));
 
         env.events()
             .publish((symbol_short!("s_toggle"), stream_id), ());
@@ -207,6 +232,7 @@ impl StreamingContract {
             .expect("stream not found");
 
         stream.recipient.require_auth();
+        bump_instance(&env);
 
         let now = env.ledger().timestamp();
 
@@ -239,6 +265,7 @@ impl StreamingContract {
         env.storage()
             .persistent()
             .set(&DataKey::Stream(stream_id), &stream);
+        bump(&env, &DataKey::Stream(stream_id));
 
         env.events()
             .publish((symbol_short!("s_wdraw"), stream_id), payout);
@@ -277,12 +304,28 @@ impl StreamingContract {
     pub fn get_admin(env: Env) -> Address {
         env.storage().instance().get(&DataKey::Admin).unwrap()
     }
+
+    /// Keeps a stream (and the contract instance) alive. Anyone may call
+    /// this; it only extends TTLs, it changes no data.
+    pub fn extend_ttl(env: Env, stream_id: u32) {
+        bump_instance(&env);
+        bump(&env, &DataKey::StreamCount);
+        assert!(
+            env.storage().persistent().has(&DataKey::Stream(stream_id)),
+            "stream not found"
+        );
+        bump(&env, &DataKey::Stream(stream_id));
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use soroban_sdk::{testutils::{Address as _, Ledger}, vec, Env, IntoVal, Symbol};
+    use soroban_sdk::{
+        testutils::{storage::{Instance as _, Persistent as _}, Address as _, Ledger},
+        token::StellarAssetClient,
+        vec, Env, IntoVal, Symbol,
+    };
 
     fn setup_env() -> Env {
         Env::default()
@@ -291,8 +334,39 @@ mod tests {
     fn deploy(env: &Env) -> (StreamingContractClient<'_>, Address) {
         let admin = Address::generate(env);
         let token = env.register_stellar_asset_contract_v2(admin.clone()).address();
-        let id = env.register(StreamingContract, (admin.clone(), token));
+        let id = env.register(StreamingContract, (admin.clone(), token.clone()));
+        env.mock_all_auths();
+        StellarAssetClient::new(env, &token).mint(&id, &1_000_000_000_000);
         (StreamingContractClient::new(env, &id), admin)
+    }
+
+    #[test]
+    fn streams_get_a_long_ttl_and_anyone_can_renew_it() {
+        let env = setup_env();
+        env.ledger().with_mut(|l| l.timestamp = 1_000);
+        let (client, _) = deploy(&env);
+        let recipient = Address::generate(&env);
+        client.create_stream(&recipient, &10, &(1_000 + 90 * 86_400));
+
+        let id = client.address.clone();
+        let ttl = |key: DataKey| env.as_contract(&id, || env.storage().persistent().get_ttl(&key));
+        assert_eq!(ttl(DataKey::Stream(0)), TTL_EXTEND_TO);
+        assert_eq!(ttl(DataKey::StreamCount), TTL_EXTEND_TO);
+        assert_eq!(env.as_contract(&id, || env.storage().instance().get_ttl()), TTL_EXTEND_TO);
+
+        env.ledger().with_mut(|l| l.sequence_number += 20 * DAY_IN_LEDGERS);
+        assert!(ttl(DataKey::Stream(0)) < TTL_THRESHOLD);
+        env.set_auths(&[]);
+        client.extend_ttl(&0);
+        assert_eq!(ttl(DataKey::Stream(0)), TTL_EXTEND_TO);
+    }
+
+    #[test]
+    #[should_panic(expected = "stream not found")]
+    fn extend_ttl_on_unknown_stream_panics() {
+        let env = setup_env();
+        let (client, _) = deploy(&env);
+        client.extend_ttl(&7);
     }
 
     #[test]
