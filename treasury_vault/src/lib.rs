@@ -1,7 +1,7 @@
 #![no_std]
 use soroban_sdk::{
     contract, contractimpl, contracttype, symbol_short, vec,
-    token, Address, Bytes, BytesN, Env, IntoVal, Symbol, U256,
+    token, Address, Bytes, BytesN, Env, IntoVal, Symbol, Val, U256,
 };
 
 // ── Storage keys ──────────────────────────────────────────────────────────────
@@ -15,6 +15,24 @@ enum DataKey {
     ProofRegistry,
     // A proof_hash that has already paid out — each proof is single-use.
     SpentProof(BytesN<32>),
+}
+
+// ── Storage TTL ──────────────────────────────────────────────────────────────
+//
+// Soroban archives entries whose TTL runs out. Instance storage (admin, token,
+// wiring) is bumped on every call; persistent entries are bumped whenever they
+// are written or used, and anyone can bump them explicitly via `extend_ttl`.
+
+const DAY_IN_LEDGERS: u32 = 17_280; // ~5s ledgers
+const TTL_EXTEND_TO: u32 = 30 * DAY_IN_LEDGERS;
+const TTL_THRESHOLD: u32 = TTL_EXTEND_TO - DAY_IN_LEDGERS;
+
+fn bump_instance(env: &Env) {
+    env.storage().instance().extend_ttl(TTL_THRESHOLD, TTL_EXTEND_TO);
+}
+
+fn bump<K: IntoVal<Env, Val>>(env: &Env, key: &K) {
+    env.storage().persistent().extend_ttl(key, TTL_THRESHOLD, TTL_EXTEND_TO);
 }
 
 /// Mirror of proof_registry's `ProofEntry`, decoded from the cross-contract
@@ -122,6 +140,9 @@ impl TreasuryVaultContract {
         env.storage().instance().set(&DataKey::Token, &usdc_token);
         env.storage().persistent().set(&DataKey::TotalRaised, &0i128);
         env.storage().persistent().set(&DataKey::TotalDisbursed, &0i128);
+        bump_instance(&env);
+        bump(&env, &DataKey::TotalRaised);
+        bump(&env, &DataKey::TotalDisbursed);
     }
 
     /// Deposit USDC into the vault.
@@ -133,6 +154,7 @@ impl TreasuryVaultContract {
     /// `amount` is in token stroops (7 decimal places: 1 USDC = 10_000_000).
     pub fn deposit(env: Env, depositor: Address, amount: i128) {
         depositor.require_auth();
+        bump_instance(&env);
         assert!(amount > 0, "amount must be positive");
 
         let token_addr: Address = env.storage().instance().get(&DataKey::Token).unwrap();
@@ -152,6 +174,7 @@ impl TreasuryVaultContract {
         env.storage()
             .persistent()
             .set(&DataKey::TotalRaised, &(raised + amount));
+        bump(&env, &DataKey::TotalRaised);
 
         env.events()
             .publish((symbol_short!("deposit"), depositor), amount);
@@ -164,6 +187,7 @@ impl TreasuryVaultContract {
     pub fn set_proof_registry(env: Env, registry: Address) {
         let admin: Address = env.storage().instance().get(&DataKey::Admin).unwrap();
         admin.require_auth();
+        bump_instance(&env);
         env.storage().instance().set(&DataKey::ProofRegistry, &registry);
     }
 
@@ -195,6 +219,7 @@ impl TreasuryVaultContract {
     ) {
         let admin: Address = env.storage().instance().get(&DataKey::Admin).unwrap();
         admin.require_auth();
+        bump_instance(&env);
         assert!(amount > 0, "amount must be positive");
 
         let registry: Address = env
@@ -233,6 +258,7 @@ impl TreasuryVaultContract {
             "proof does not match this recipient and amount"
         );
         env.storage().persistent().set(&spent_key, &true);
+        bump(&env, &spent_key);
 
         let token_addr: Address = env.storage().instance().get(&DataKey::Token).unwrap();
         let token_client = token::Client::new(&env, &token_addr);
@@ -253,6 +279,7 @@ impl TreasuryVaultContract {
         env.storage()
             .persistent()
             .set(&DataKey::TotalDisbursed, &(disbursed + amount));
+        bump(&env, &DataKey::TotalDisbursed);
 
         env.events()
             .publish((symbol_short!("disburse"), recipient), (amount, proof_hash));
@@ -283,6 +310,14 @@ impl TreasuryVaultContract {
         }
     }
 
+    /// Keeps the vault instance and its totals alive. Anyone may call this; it
+    /// only extends TTLs, it changes no data.
+    pub fn extend_ttl(env: Env) {
+        bump_instance(&env);
+        bump(&env, &DataKey::TotalRaised);
+        bump(&env, &DataKey::TotalDisbursed);
+    }
+
     /// True if this proof has already paid out a disbursement.
     pub fn is_proof_spent(env: Env, proof_hash: BytesN<32>) -> bool {
         env.storage().persistent().has(&DataKey::SpentProof(proof_hash))
@@ -300,6 +335,7 @@ impl TreasuryVaultContract {
     pub fn transfer_admin(env: Env, new_admin: Address) {
         let admin: Address = env.storage().instance().get(&DataKey::Admin).unwrap();
         admin.require_auth();
+        bump_instance(&env);
         env.storage().instance().set(&DataKey::Admin, &new_admin);
     }
 }
@@ -309,7 +345,7 @@ mod tests {
     use super::*;
     use proof_registry::ProofRegistryContract;
     use soroban_sdk::{
-        testutils::Address as _,
+        testutils::{storage::{Instance as _, Persistent as _}, Address as _, Ledger},
         token::{Client as TokenClient, StellarAssetClient},
         Symbol,
     };
@@ -412,6 +448,32 @@ mod tests {
             &Symbol::new(env, proof_type),
         );
         setup
+    }
+
+    #[test]
+    fn deposit_and_disburse_keep_state_alive() {
+        let env = Env::default();
+        // The test token isn't bumped by anyone (the real USDC SAC is), so
+        // give new entries 25 days by default; ours must still reach 30.
+        env.ledger().with_mut(|l| l.min_persistent_entry_ttl = 25 * DAY_IN_LEDGERS);
+        env.mock_all_auths();
+        let hash = some_hash(&env, 1);
+        let setup = ready(&env, &hash, PIH_500000_PAYROLL, "payroll");
+        env.ledger().with_mut(|l| l.sequence_number += 20 * DAY_IN_LEDGERS);
+
+        setup.vault.disburse(&recipient(&env), &500_000, &hash, &root(&env), &commitment(&env));
+
+        let id = setup.vault.address.clone();
+        let ttl = |key: DataKey| env.as_contract(&id, || env.storage().persistent().get_ttl(&key));
+        assert_eq!(ttl(DataKey::SpentProof(hash.clone())), TTL_EXTEND_TO);
+        assert_eq!(ttl(DataKey::TotalDisbursed), TTL_EXTEND_TO);
+        assert_eq!(env.as_contract(&id, || env.storage().instance().get_ttl()), TTL_EXTEND_TO);
+
+        // The deposit happened 20 days ago; extend_ttl renews it, no auth needed.
+        assert!(ttl(DataKey::TotalRaised) < TTL_THRESHOLD);
+        env.set_auths(&[]);
+        setup.vault.extend_ttl();
+        assert_eq!(ttl(DataKey::TotalRaised), TTL_EXTEND_TO);
     }
 
     #[test]
