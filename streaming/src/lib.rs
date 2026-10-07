@@ -1,8 +1,39 @@
 #![no_std]
 use soroban_sdk::{
-    contract, contractimpl, contracttype, symbol_short,
+    contract, contracterror, contractimpl, contracttype, panic_with_error, symbol_short,
     token, Address, Env, IntoVal, Val, Vec,
 };
+
+/// Every way a call can fail. Clients receive these as `Error(Contract, #code)`.
+#[contracterror]
+#[derive(Copy, Clone, Debug, Eq, PartialEq, PartialOrd, Ord)]
+#[repr(u32)]
+pub enum Error {
+    /// `flow_rate_per_second` must be positive.
+    InvalidFlowRate = 1,
+    /// `end_time` must be in the future.
+    InvalidEndTime = 2,
+    /// The stream's total doesn't fit in an i128.
+    Overflow = 3,
+    /// The unreserved balance can't cover this stream.
+    InsufficientBalance = 4,
+    /// No stream with this id.
+    StreamNotFound = 5,
+    /// The stream's `end_time` has passed, so it can't be resumed.
+    StreamEnded = 6,
+    /// The stream is completed.
+    StreamCompleted = 7,
+    /// Nothing has accrued since the last withdrawal.
+    NothingToWithdraw = 8,
+    /// There's no admin handover to accept or cancel.
+    NoPendingAdmin = 9,
+}
+
+fn ensure(env: &Env, condition: bool, error: Error) {
+    if !condition {
+        panic_with_error!(env, error);
+    }
+}
 
 // ── Storage keys ──────────────────────────────────────────────────────────────
 
@@ -150,21 +181,21 @@ impl StreamingContract {
         admin.require_auth();
         bump_instance(&env);
 
-        assert!(flow_rate_per_second > 0, "flow rate must be positive");
+        ensure(&env, flow_rate_per_second > 0, Error::InvalidFlowRate);
 
         let now = env.ledger().timestamp();
-        assert!(end_time > now, "end_time must be in the future");
+        ensure(&env, end_time > now, Error::InvalidEndTime);
 
         let total = flow_rate_per_second
             .checked_mul((end_time - now) as i128)
-            .expect("stream total overflows");
+            .unwrap_or_else(|| panic_with_error!(&env, Error::Overflow));
 
         let token_addr: Address = env.storage().instance().get(&DataKey::Token).unwrap();
         let balance = token::Client::new(&env, &token_addr).balance(&env.current_contract_address());
         let committed = reserved(&env)
             .checked_add(total)
-            .expect("stream total overflows");
-        assert!(balance >= committed, "insufficient contract balance for stream");
+            .unwrap_or_else(|| panic_with_error!(&env, Error::Overflow));
+        ensure(&env, balance >= committed, Error::InsufficientBalance);
 
         let id: u32 = env
             .storage()
@@ -212,7 +243,7 @@ impl StreamingContract {
             .storage()
             .persistent()
             .get(&DataKey::Stream(stream_id))
-            .expect("stream not found");
+            .unwrap_or_else(|| panic_with_error!(&env, Error::StreamNotFound));
         let before = obligation(&stream);
         let now = env.ledger().timestamp();
 
@@ -223,11 +254,11 @@ impl StreamingContract {
                 stream.status = StreamStatus::Paused;
             }
             StreamStatus::Paused => {
-                assert!(now < stream.end_time, "stream has ended");
+                ensure(&env, now < stream.end_time, Error::StreamEnded);
                 stream.last_update = now;
                 stream.status = StreamStatus::Active;
             }
-            StreamStatus::Completed => panic!("stream already completed"),
+            StreamStatus::Completed => panic_with_error!(&env, Error::StreamCompleted),
         }
 
         save(&env, before, &stream);
@@ -249,7 +280,7 @@ impl StreamingContract {
             .storage()
             .persistent()
             .get(&DataKey::Stream(stream_id))
-            .expect("stream not found");
+            .unwrap_or_else(|| panic_with_error!(&env, Error::StreamNotFound));
         stream.accumulated + pending_accrual(&stream, env.ledger().timestamp())
     }
 
@@ -267,7 +298,7 @@ impl StreamingContract {
             .storage()
             .persistent()
             .get(&DataKey::Stream(stream_id))
-            .expect("stream not found");
+            .unwrap_or_else(|| panic_with_error!(&env, Error::StreamNotFound));
 
         stream.recipient.require_auth();
         bump_instance(&env);
@@ -275,7 +306,7 @@ impl StreamingContract {
         let before = obligation(&stream);
         let now = env.ledger().timestamp();
         let payout = stream.accumulated + pending_accrual(&stream, now);
-        assert!(payout > 0, "nothing to withdraw");
+        ensure(&env, payout > 0, Error::NothingToWithdraw);
 
         let token_addr: Address = env.storage().instance().get(&DataKey::Token).unwrap();
         let token_client = token::Client::new(&env, &token_addr);
@@ -305,7 +336,7 @@ impl StreamingContract {
         env.storage()
             .persistent()
             .get(&DataKey::Stream(stream_id))
-            .expect("stream not found")
+            .unwrap_or_else(|| panic_with_error!(&env, Error::StreamNotFound))
     }
 
     /// Returns up to `limit` streams (max `MAX_PAGE`) starting at id `start`,
@@ -377,7 +408,7 @@ impl StreamingContract {
             .storage()
             .instance()
             .get(&DataKey::PendingAdmin)
-            .expect("no pending admin");
+            .unwrap_or_else(|| panic_with_error!(&env, Error::NoPendingAdmin));
         pending.require_auth();
         bump_instance(&env);
         let old: Address = env.storage().instance().get(&DataKey::Admin).unwrap();
@@ -391,10 +422,7 @@ impl StreamingContract {
         let admin: Address = env.storage().instance().get(&DataKey::Admin).unwrap();
         admin.require_auth();
         bump_instance(&env);
-        assert!(
-            env.storage().instance().has(&DataKey::PendingAdmin),
-            "no pending admin"
-        );
+        ensure(&env, env.storage().instance().has(&DataKey::PendingAdmin), Error::NoPendingAdmin);
         env.storage().instance().remove(&DataKey::PendingAdmin);
         env.events().publish((symbol_short!("adm_cncl"), admin), ());
     }
@@ -408,9 +436,10 @@ impl StreamingContract {
     pub fn extend_ttl(env: Env, stream_id: u32) {
         bump_instance(&env);
         bump(&env, &DataKey::StreamCount);
-        assert!(
+        ensure(
+            &env,
             env.storage().persistent().has(&DataKey::Stream(stream_id)),
-            "stream not found"
+            Error::StreamNotFound,
         );
         bump(&env, &DataKey::Stream(stream_id));
     }
@@ -460,7 +489,7 @@ mod tests {
     }
 
     #[test]
-    #[should_panic(expected = "stream not found")]
+    #[should_panic(expected = "Error(Contract, #5)")]
     fn extend_ttl_on_unknown_stream_panics() {
         let env = setup_env();
         let (client, _) = deploy(&env);
@@ -504,7 +533,7 @@ mod tests {
     }
 
     #[test]
-    #[should_panic(expected = "no pending admin")]
+    #[should_panic(expected = "Error(Contract, #9)")]
     fn accept_without_a_proposal_panics() {
         let env = Env::default();
         env.mock_all_auths();
@@ -560,6 +589,17 @@ mod tests {
         assert_eq!(tail.len(), 5);
         assert_eq!(tail.get(0).unwrap().id, 50);
         assert_eq!(client.get_streams(&u32::MAX, &u32::MAX).len(), 0);
+    }
+
+    #[test]
+    fn clients_get_typed_errors() {
+        let env = setup_env();
+        let (client, _) = with_stream(&env);
+        let r = Address::generate(&env);
+        assert_eq!(client.try_create_stream(&r, &0, &(T0 + 1)), Err(Ok(soroban_sdk::Error::from(Error::InvalidFlowRate))));
+        assert_eq!(client.try_create_stream(&r, &1, &T0), Err(Ok(soroban_sdk::Error::from(Error::InvalidEndTime))));
+        assert_eq!(client.try_withdraw(&0), Err(Ok(soroban_sdk::Error::from(Error::NothingToWithdraw))));
+        assert_eq!(client.try_get_stream(&9).err(), Some(Ok(soroban_sdk::Error::from(Error::StreamNotFound))));
     }
 
     #[test]
@@ -643,7 +683,7 @@ mod tests {
     }
 
     #[test]
-    #[should_panic(expected = "stream has ended")]
+    #[should_panic(expected = "Error(Contract, #6)")]
     fn resuming_after_end_time_is_rejected() {
         let env = setup_env();
         let (client, _) = with_stream(&env);
@@ -666,7 +706,7 @@ mod tests {
     }
 
     #[test]
-    #[should_panic(expected = "nothing to withdraw")]
+    #[should_panic(expected = "Error(Contract, #8)")]
     fn double_withdraw_in_the_same_second_panics() {
         let env = setup_env();
         let (client, _) = with_stream(&env);
@@ -676,7 +716,7 @@ mod tests {
     }
 
     #[test]
-    #[should_panic(expected = "nothing to withdraw")]
+    #[should_panic(expected = "Error(Contract, #8)")]
     fn withdraw_after_completion_panics() {
         let env = setup_env();
         let (client, _) = with_stream(&env);
@@ -687,7 +727,7 @@ mod tests {
     }
 
     #[test]
-    #[should_panic(expected = "stream already completed")]
+    #[should_panic(expected = "Error(Contract, #7)")]
     fn toggling_a_completed_stream_panics() {
         let env = setup_env();
         let (client, _) = with_stream(&env);
@@ -720,7 +760,7 @@ mod tests {
     }
 
     #[test]
-    #[should_panic(expected = "stream total overflows")]
+    #[should_panic(expected = "Error(Contract, #3)")]
     fn huge_flow_rates_fail_cleanly() {
         let env = setup_env();
         let (client, _) = with_stream(&env);

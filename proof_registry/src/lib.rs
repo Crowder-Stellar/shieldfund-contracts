@@ -1,8 +1,31 @@
 #![no_std]
 use soroban_sdk::{
-    contract, contractimpl, contracttype, symbol_short,
+    contract, contracterror, contractimpl, contracttype, panic_with_error, symbol_short,
     Address, BytesN, Env, IntoVal, Symbol, Val, Vec,
 };
+
+/// Every way a call can fail. Clients receive these as `Error(Contract, #code)`.
+#[contracterror]
+#[derive(Copy, Clone, Debug, Eq, PartialEq, PartialOrd, Ord)]
+#[repr(u32)]
+pub enum Error {
+    /// The caller isn't the admin.
+    NotAdmin = 1,
+    /// `proof_type` isn't payroll, operational or relief.
+    UnknownProofType = 2,
+    /// This proof hash is already registered.
+    AlreadyRegistered = 3,
+    /// No proof with this id or hash.
+    ProofNotFound = 4,
+    /// There's no admin handover to accept or cancel.
+    NoPendingAdmin = 5,
+}
+
+fn ensure(env: &Env, condition: bool, error: Error) {
+    if !condition {
+        panic_with_error!(env, error);
+    }
+}
 
 // ── Storage keys ──────────────────────────────────────────────────────────────
 
@@ -97,20 +120,22 @@ impl ProofRegistryContract {
         bump_instance(&env);
 
         let admin: Address = env.storage().instance().get(&DataKey::Admin).unwrap();
-        assert!(submitter == admin, "only admin may submit proofs");
-        assert!(
+        ensure(&env, submitter == admin, Error::NotAdmin);
+        ensure(
+            &env,
             proof_type == Symbol::new(&env, "payroll")
                 || proof_type == Symbol::new(&env, "operational")
                 || proof_type == Symbol::new(&env, "relief"),
-            "unknown proof_type"
+            Error::UnknownProofType,
         );
 
         // Guard against duplicate registrations.
-        assert!(
+        ensure(
+            &env,
             !env.storage()
                 .persistent()
                 .has(&DataKey::HashIndex(proof_hash.clone())),
-            "proof already registered"
+            Error::AlreadyRegistered,
         );
 
         let id: u32 = env
@@ -154,7 +179,7 @@ impl ProofRegistryContract {
         env.storage()
             .persistent()
             .get(&DataKey::Proof(id))
-            .expect("proof not found")
+            .unwrap_or_else(|| panic_with_error!(&env, Error::ProofNotFound))
     }
 
     /// Returns up to `limit` proofs (max `MAX_PAGE`) starting at id `start`,
@@ -222,7 +247,7 @@ impl ProofRegistryContract {
         env.storage()
             .persistent()
             .get(&DataKey::HashIndex(proof_hash))
-            .expect("proof not found")
+            .unwrap_or_else(|| panic_with_error!(&env, Error::ProofNotFound))
     }
 
     /// Returns the full entry for a given proof hash, or panics if not found.
@@ -266,7 +291,7 @@ impl ProofRegistryContract {
             .storage()
             .instance()
             .get(&DataKey::PendingAdmin)
-            .expect("no pending admin");
+            .unwrap_or_else(|| panic_with_error!(&env, Error::NoPendingAdmin));
         pending.require_auth();
         bump_instance(&env);
         let old: Address = env.storage().instance().get(&DataKey::Admin).unwrap();
@@ -280,10 +305,7 @@ impl ProofRegistryContract {
         let admin: Address = env.storage().instance().get(&DataKey::Admin).unwrap();
         admin.require_auth();
         bump_instance(&env);
-        assert!(
-            env.storage().instance().has(&DataKey::PendingAdmin),
-            "no pending admin"
-        );
+        ensure(&env, env.storage().instance().has(&DataKey::PendingAdmin), Error::NoPendingAdmin);
         env.storage().instance().remove(&DataKey::PendingAdmin);
         env.events().publish((symbol_short!("adm_cncl"), admin), ());
     }
@@ -341,7 +363,7 @@ mod tests {
     }
 
     #[test]
-    #[should_panic(expected = "proof already registered")]
+    #[should_panic(expected = "Error(Contract, #3)")]
     fn duplicate_registration_panics() {
         let env = Env::default();
         env.mock_all_auths();
@@ -357,7 +379,7 @@ mod tests {
     }
 
     #[test]
-    #[should_panic(expected = "only admin may submit proofs")]
+    #[should_panic(expected = "Error(Contract, #1)")]
     fn non_admin_submitter_panics() {
         let env = Env::default();
         env.mock_all_auths();
@@ -485,7 +507,7 @@ mod tests {
     }
 
     #[test]
-    #[should_panic(expected = "no pending admin")]
+    #[should_panic(expected = "Error(Contract, #5)")]
     fn accept_without_a_proposal_panics() {
         let env = Env::default();
         env.mock_all_auths();
@@ -593,7 +615,7 @@ mod tests {
     }
 
     #[test]
-    #[should_panic(expected = "unknown proof_type")]
+    #[should_panic(expected = "Error(Contract, #2)")]
     fn unknown_proof_types_are_rejected_at_registration() {
         let env = Env::default();
         env.mock_all_auths();
@@ -611,6 +633,26 @@ mod tests {
             client.register_proof(&admin, &hash, &zero_hash(&env), &Symbol::new(&env, ty));
         }
         assert_eq!(client.get_proof_count(), 3);
+    }
+
+    #[test]
+    fn clients_get_typed_errors() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (client, admin) = deploy(&env);
+        let pt = Symbol::new(&env, "payroll");
+        client.register_proof(&admin, &one_hash(&env), &zero_hash(&env), &pt);
+
+        assert_eq!(
+            client.try_register_proof(&admin, &one_hash(&env), &zero_hash(&env), &pt),
+            Err(Ok(soroban_sdk::Error::from(Error::AlreadyRegistered)))
+        );
+        assert_eq!(
+            client.try_register_proof(&Address::generate(&env), &zero_hash(&env), &zero_hash(&env), &pt),
+            Err(Ok(soroban_sdk::Error::from(Error::NotAdmin)))
+        );
+        assert_eq!(client.try_get_proof(&9).err(), Some(Ok(soroban_sdk::Error::from(Error::ProofNotFound))));
+        assert_eq!(client.try_accept_admin(), Err(Ok(soroban_sdk::Error::from(Error::NoPendingAdmin))));
     }
 
     #[test]
@@ -650,7 +692,7 @@ mod tests {
     }
 
     #[test]
-    #[should_panic(expected = "proof not found")]
+    #[should_panic(expected = "Error(Contract, #4)")]
     fn get_proof_by_hash_unknown_panics() {
         let env = Env::default();
         let (client, _) = deploy(&env);
