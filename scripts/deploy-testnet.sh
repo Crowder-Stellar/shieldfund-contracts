@@ -23,8 +23,14 @@ set -euo pipefail
 
 NETWORK="${NETWORK:-testnet}"
 
-# USDC on Stellar testnet (Circle's deployed SAC)
-USDC_TESTNET="CBIELTK6YBZJU5UP2WWQEQZMYJMZROFZKYPVCCNWY5TU4BOQ3EOWXPD"
+# Circle's testnet USDC Stellar Asset Contract:
+#   stellar contract id asset --network testnet \
+#     --asset USDC:GBBD47IF6LWK7P7MDEVSCWR7DPUWV3NY3DTQEVFL4NAT4AQH3ZLLFLA5
+USDC_TESTNET="CBIELTK6YBZJU5UP2WWQEUCYKLPU6AUNZ2BQ4WWFEIE3USCIHMXQDAMA"
+if [ -z "${USDC_TOKEN:-}" ] && [ "$NETWORK" != "testnet" ]; then
+  echo "✗ USDC_TOKEN must be set explicitly for NETWORK=$NETWORK (the default is Circle's testnet USDC)." >&2
+  exit 1
+fi
 USDC_TOKEN="${USDC_TOKEN:-$USDC_TESTNET}"
 
 ADMIN="${ADMIN_ACCOUNT:?Set ADMIN_ACCOUNT to a Stellar CLI key name or G... address}"
@@ -38,6 +44,21 @@ echo "  Admin  : $ADMIN_ADDRESS"
 echo "  Network: $NETWORK"
 echo "  Token  : $USDC_TOKEN"
 echo ""
+
+# ── 0. Check the token before deploying anything ───────────────────────────
+# Both treasury_vault and streaming bake the token in at construction, so a
+# bad id would leave two unusable contracts behind.
+
+if ! [[ "$USDC_TOKEN" =~ ^C[A-Z2-7]{55}$ ]]; then
+  echo "✗ USDC_TOKEN '$USDC_TOKEN' is not a valid contract id (C + 55 base32 chars)." >&2
+  exit 1
+fi
+if ! TOKEN_SYMBOL=$(stellar contract invoke --id "$USDC_TOKEN" --source "$ADMIN" --network "$NETWORK" \
+    --send=no -- symbol 2>/dev/null | tr -d '"'); then
+  echo "✗ USDC_TOKEN $USDC_TOKEN is not a token contract on $NETWORK (symbol() failed)." >&2
+  exit 1
+fi
+echo "  Token symbol: $TOKEN_SYMBOL"
 
 # ── 1. Build all contracts ─────────────────────────────────────────────────
 
@@ -109,5 +130,5 @@ echo "  STREAMING      : $STREAMING_ID"
 echo "  PROOF_REGISTRY : $REGISTRY_ID"
 echo "  USDC_SAC       : $USDC_TOKEN"
 echo ""
-echo "  → paste these into shieldfund-frontend src/lib/contracts.ts and the backend .env"
+echo "  → set these in the frontend (VITE_*_CONTRACT_ID) and backend (*_CONTRACT_ID) env"
 echo ""
