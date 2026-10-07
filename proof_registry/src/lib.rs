@@ -98,6 +98,12 @@ impl ProofRegistryContract {
 
         let admin: Address = env.storage().instance().get(&DataKey::Admin).unwrap();
         assert!(submitter == admin, "only admin may submit proofs");
+        assert!(
+            proof_type == Symbol::new(&env, "payroll")
+                || proof_type == Symbol::new(&env, "operational")
+                || proof_type == Symbol::new(&env, "relief"),
+            "unknown proof_type"
+        );
 
         // Guard against duplicate registrations.
         assert!(
@@ -584,6 +590,27 @@ mod tests {
 
         assert_eq!(client.get_proofs(&60, &10).len(), 0);
         assert_eq!(client.get_proofs(&u32::MAX, &u32::MAX).len(), 0);
+    }
+
+    #[test]
+    #[should_panic(expected = "unknown proof_type")]
+    fn unknown_proof_types_are_rejected_at_registration() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (client, admin) = deploy(&env);
+        client.register_proof(&admin, &one_hash(&env), &zero_hash(&env), &Symbol::new(&env, "payrol"));
+    }
+
+    #[test]
+    fn all_three_proof_types_are_accepted() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (client, admin) = deploy(&env);
+        for (i, ty) in ["payroll", "operational", "relief"].iter().enumerate() {
+            let hash = BytesN::from_array(&env, &[i as u8 + 10; 32]);
+            client.register_proof(&admin, &hash, &zero_hash(&env), &Symbol::new(&env, ty));
+        }
+        assert_eq!(client.get_proof_count(), 3);
     }
 
     #[test]
