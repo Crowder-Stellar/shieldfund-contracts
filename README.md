@@ -118,6 +118,7 @@ streaming contract
 | `create_stream` | `admin` | `recipient: Address`, `flow_rate_per_second: i128`, `end_time: u64` | `u32` (stream ID) |
 | `toggle_stream` | `admin` | `stream_id: u32` | `StreamStatus` |
 | `get_accumulated` | — | `stream_id: u32` | `i128` |
+| `get_reserved` | — | — | `i128` (tokens promised to streams) |
 | `withdraw` | `recipient` | `stream_id: u32` | `i128` (amount paid) |
 | `get_stream` | — | `stream_id: u32` | `Stream` |
 | `get_streams` | — | `start: u32`, `limit: u32` (max 50) | `Vec<Stream>` |
@@ -129,6 +130,11 @@ streaming contract
 | `cancel_admin_transfer` | `admin` | — | — |
 | `get_pending_admin` | — | — | `Option<Address>` |
 | `extend_ttl` | — | `stream_id: u32` | — |
+
+**Funding:** the contract tracks how much every stream can still pay out (`get_reserved`). A new
+stream's full total must fit in `balance - get_reserved()`, so two streams can never be promised the
+same tokens. Pausing forfeits the paused time (it isn't added to `end_time`), and a stream can't be
+resumed after its `end_time`.
 
 **Flow rate formula:** `flow_rate_per_second = ceil(monthly_amount_stroops / 2_592_000)`
 

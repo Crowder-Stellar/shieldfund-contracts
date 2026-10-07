@@ -458,6 +458,8 @@ mod tests {
         "0xe910f2502d7cd10d2510eac5dcfd2f970b5ad51151c3ebc3e658d7ae72fecb62";
     const PIH_499999_PAYROLL: &str =
         "0xf5d1987289f0e2e656ab3f2f7ad45db4d393499634383d8588dcbdecff62d796";
+    const PIH_2000000_PAYROLL: &str =
+        "0x4d3197baede201b251f37ee37bb0c7491de966932d271bf5961b3a622756b405";
 
     fn address(env: &Env, strkey: &str) -> Address {
         Address::from_string(&soroban_sdk::String::from_str(env, strkey))
@@ -598,6 +600,50 @@ mod tests {
         assert_eq!(topics, vec![&env, symbol_short!("disburse").into_val(&env), recipient(&env).into_val(&env)]);
         let (amount, proof): (i128, BytesN<32>) = data.into_val(&env);
         assert_eq!((amount, proof), (500_000, hash));
+    }
+
+    #[test]
+    fn deposits_and_disbursements_must_be_positive() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let hash = some_hash(&env, 1);
+        let setup = ready(&env, &hash, PIH_500000_PAYROLL, "payroll");
+        let depositor = Address::generate(&env);
+        for amount in [0i128, -1, i128::MIN] {
+            assert!(setup.vault.try_deposit(&depositor, &amount).is_err());
+            assert!(setup
+                .vault
+                .try_disburse(&recipient(&env), &amount, &hash, &root(&env), &commitment(&env))
+                .is_err());
+        }
+        assert!(!setup.vault.is_proof_spent(&hash));
+        assert_eq!(setup.vault.get_stats().total_raised, 1_000_000);
+    }
+
+    #[test]
+    #[should_panic(expected = "insufficient vault balance")]
+    fn disbursing_more_than_the_vault_holds_panics() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let hash = some_hash(&env, 1);
+        // Valid proof for 2,000,000 against a vault funded with 1,000,000.
+        let setup = ready(&env, &hash, PIH_2000000_PAYROLL, "payroll");
+        setup.vault.disburse(&recipient(&env), &2_000_000, &hash, &root(&env), &commitment(&env));
+    }
+
+    #[test]
+    fn deposits_and_disbursements_keep_totals_consistent() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let hash = some_hash(&env, 1);
+        let setup = ready(&env, &hash, PIH_500000_PAYROLL, "payroll");
+        fund_vault(&env, &setup, 250_000);
+        setup.vault.disburse(&recipient(&env), &500_000, &hash, &root(&env), &commitment(&env));
+
+        let stats = setup.vault.get_stats();
+        assert_eq!(stats.total_raised, 1_250_000);
+        assert_eq!(stats.total_disbursed, 500_000);
+        assert_eq!(stats.vault_balance, stats.total_raised - stats.total_disbursed);
     }
 
     #[test]

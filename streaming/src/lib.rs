@@ -13,6 +13,9 @@ enum DataKey {
     Token,
     StreamCount,
     Stream(u32),
+    // Sum of every stream's outstanding obligation — tokens the contract has
+    // already promised and must not promise again.
+    Reserved,
 }
 
 // ── Storage TTL ──────────────────────────────────────────────────────────────
@@ -66,6 +69,48 @@ pub struct Stream {
     pub status: StreamStatus,
 }
 
+// ── Accounting ───────────────────────────────────────────────────────────────
+
+/// Tokens accrued since `last_update` and not yet folded into `accumulated`.
+/// Never counts time past `end_time`, and nothing accrues while paused.
+fn pending_accrual(stream: &Stream, now: u64) -> i128 {
+    match stream.status {
+        StreamStatus::Active => {
+            let elapsed = now.min(stream.end_time).saturating_sub(stream.last_update);
+            stream.flow_rate_per_second * elapsed as i128
+        }
+        StreamStatus::Paused | StreamStatus::Completed => 0,
+    }
+}
+
+/// The most this stream can still pay out: what it holds plus everything it
+/// could accrue until `end_time`. Pausing and withdrawing only lower it.
+fn obligation(stream: &Stream) -> i128 {
+    match stream.status {
+        StreamStatus::Completed => stream.accumulated,
+        StreamStatus::Active | StreamStatus::Paused => {
+            let remaining = stream.end_time.saturating_sub(stream.last_update);
+            stream.accumulated + stream.flow_rate_per_second * remaining as i128
+        }
+    }
+}
+
+fn reserved(env: &Env) -> i128 {
+    env.storage().persistent().get(&DataKey::Reserved).unwrap_or(0)
+}
+
+fn set_reserved(env: &Env, value: i128) {
+    env.storage().persistent().set(&DataKey::Reserved, &value);
+    bump(env, &DataKey::Reserved);
+}
+
+/// Persists `stream` and moves `Reserved` by the change in its obligation.
+fn save(env: &Env, before: i128, stream: &Stream) {
+    set_reserved(env, reserved(env) - before + obligation(stream));
+    env.storage().persistent().set(&DataKey::Stream(stream.id), stream);
+    bump(env, &DataKey::Stream(stream.id));
+}
+
 // ── Contract ─────────────────────────────────────────────────────────────────
 
 #[contract]
@@ -81,6 +126,7 @@ impl StreamingContract {
         env.storage().persistent().set(&DataKey::StreamCount, &0u32);
         bump_instance(&env);
         bump(&env, &DataKey::StreamCount);
+        set_reserved(&env, 0);
         env.events().publish((symbol_short!("init"), admin), usdc_token);
     }
 
@@ -91,8 +137,9 @@ impl StreamingContract {
     ///
     /// `end_time`: Unix timestamp when the stream ends.
     ///
-    /// The streaming contract must hold enough USDC to cover the full
-    /// stream period. Fund it via a direct token transfer before calling this.
+    /// The contract's balance must cover this stream's full total *on top of*
+    /// what existing streams can still pay out (`get_reserved`). Fund it via a
+    /// direct token transfer before calling this.
     pub fn create_stream(
         env: Env,
         recipient: Address,
@@ -108,15 +155,16 @@ impl StreamingContract {
         let now = env.ledger().timestamp();
         assert!(end_time > now, "end_time must be in the future");
 
-        // Verify the contract holds enough USDC for this stream.
+        let total = flow_rate_per_second
+            .checked_mul((end_time - now) as i128)
+            .expect("stream total overflows");
+
         let token_addr: Address = env.storage().instance().get(&DataKey::Token).unwrap();
-        let token_client = token::Client::new(&env, &token_addr);
-        let contract_balance = token_client.balance(&env.current_contract_address());
-        let total_needed = flow_rate_per_second * (end_time - now) as i128;
-        assert!(
-            contract_balance >= total_needed,
-            "insufficient contract balance for stream"
-        );
+        let balance = token::Client::new(&env, &token_addr).balance(&env.current_contract_address());
+        let committed = reserved(&env)
+            .checked_add(total)
+            .expect("stream total overflows");
+        assert!(balance >= committed, "insufficient contract balance for stream");
 
         let id: u32 = env
             .storage()
@@ -135,13 +183,10 @@ impl StreamingContract {
             status: StreamStatus::Active,
         };
 
-        env.storage()
-            .persistent()
-            .set(&DataKey::Stream(id), &stream);
+        save(&env, 0, &stream);
         env.storage()
             .persistent()
             .set(&DataKey::StreamCount, &(id + 1));
-        bump(&env, &DataKey::Stream(id));
         bump(&env, &DataKey::StreamCount);
 
         env.events().publish(
@@ -154,10 +199,10 @@ impl StreamingContract {
 
     /// Admin toggles a stream between Active and Paused.
     ///
-    /// On pause: the accrued amount is snapshotted into `accumulated` so the
-    /// live balance computation stays correct with no external cron needed.
-    /// On resume: `last_update` is set to now so we start accruing again from
-    /// the current timestamp.
+    /// On pause: what has accrued (never past `end_time`) is snapshotted into
+    /// `accumulated`. On resume: accrual restarts from now; the paused time is
+    /// forfeited, not added to the end. A stream can't be resumed once its
+    /// `end_time` has passed.
     pub fn toggle_stream(env: Env, stream_id: u32) -> StreamStatus {
         let admin: Address = env.storage().instance().get(&DataKey::Admin).unwrap();
         admin.require_auth();
@@ -168,29 +213,25 @@ impl StreamingContract {
             .persistent()
             .get(&DataKey::Stream(stream_id))
             .expect("stream not found");
-
+        let before = obligation(&stream);
         let now = env.ledger().timestamp();
 
         match stream.status {
             StreamStatus::Active => {
-                let elapsed = now.saturating_sub(stream.last_update) as i128;
-                stream.accumulated += elapsed * stream.flow_rate_per_second;
+                stream.accumulated += pending_accrual(&stream, now);
                 stream.last_update = now;
                 stream.status = StreamStatus::Paused;
             }
             StreamStatus::Paused => {
-                // Resume: update last_update so we don't accrue for the paused period.
+                assert!(now < stream.end_time, "stream has ended");
                 stream.last_update = now;
                 stream.status = StreamStatus::Active;
             }
             StreamStatus::Completed => panic!("stream already completed"),
         }
 
+        save(&env, before, &stream);
         let new_status = stream.status.clone();
-        env.storage()
-            .persistent()
-            .set(&DataKey::Stream(stream_id), &stream);
-        bump(&env, &DataKey::Stream(stream_id));
 
         env.events()
             .publish((symbol_short!("s_toggle"), stream_id), new_status.clone());
@@ -209,26 +250,18 @@ impl StreamingContract {
             .persistent()
             .get(&DataKey::Stream(stream_id))
             .expect("stream not found");
+        stream.accumulated + pending_accrual(&stream, env.ledger().timestamp())
+    }
 
-        match stream.status {
-            StreamStatus::Active => {
-                let now = env.ledger().timestamp();
-                let elapsed = now.saturating_sub(stream.last_update) as i128;
-                // Cap at end_time to avoid overflowing the stream total.
-                let effective_elapsed = if now > stream.end_time {
-                    (stream.end_time - stream.last_update) as i128
-                } else {
-                    elapsed
-                };
-                stream.accumulated + effective_elapsed * stream.flow_rate_per_second
-            }
-            StreamStatus::Paused | StreamStatus::Completed => stream.accumulated,
-        }
+    /// Tokens currently promised to streams (their combined outstanding
+    /// obligation). New streams must fit in `balance - get_reserved()`.
+    pub fn get_reserved(env: Env) -> i128 {
+        reserved(&env)
     }
 
     /// Recipient withdraws their accumulated USDC.
     ///
-    /// Marks the stream as Completed if end_time has passed.
+    /// Marks the stream as Completed once end_time has passed.
     pub fn withdraw(env: Env, stream_id: u32) -> i128 {
         let mut stream: Stream = env
             .storage()
@@ -239,17 +272,9 @@ impl StreamingContract {
         stream.recipient.require_auth();
         bump_instance(&env);
 
+        let before = obligation(&stream);
         let now = env.ledger().timestamp();
-
-        // Compute settled amount.
-        let payout = match stream.status {
-            StreamStatus::Active => {
-                let elapsed = (now.min(stream.end_time) - stream.last_update) as i128;
-                stream.accumulated + elapsed * stream.flow_rate_per_second
-            }
-            StreamStatus::Paused | StreamStatus::Completed => stream.accumulated,
-        };
-
+        let payout = stream.accumulated + pending_accrual(&stream, now);
         assert!(payout > 0, "nothing to withdraw");
 
         let token_addr: Address = env.storage().instance().get(&DataKey::Token).unwrap();
@@ -260,17 +285,12 @@ impl StreamingContract {
             &payout,
         );
 
-        // Reset accumulated and mark completed if past end_time.
         stream.accumulated = 0;
         stream.last_update = now;
         if now >= stream.end_time {
             stream.status = StreamStatus::Completed;
         }
-
-        env.storage()
-            .persistent()
-            .set(&DataKey::Stream(stream_id), &stream);
-        bump(&env, &DataKey::Stream(stream_id));
+        save(&env, before, &stream);
 
         env.events().publish(
             (symbol_short!("s_wdraw"), stream_id),
@@ -562,63 +582,176 @@ mod tests {
         assert!(res.is_err());
     }
 
-    /// `get_accumulated` for an Active stream returns accumulated + elapsed * rate.
-    #[test]
-    fn get_accumulated_active_accrues_correctly() {
-        let env = setup_env();
-        env.ledger().with_mut(|l| l.timestamp = 1_000_000);
+    const T0: u64 = 1_000_000;
 
-        let stream = Stream {
-            id: 0,
-            recipient: soroban_sdk::Address::generate(&env),
-            flow_rate_per_second: 1_000,
-            start_time: 1_000_000,
-            end_time: 1_100_000,
-            accumulated: 0,
-            last_update: 1_000_000,
-            status: StreamStatus::Active,
-        };
-
-        // Advance ledger 100 seconds
-        env.ledger().with_mut(|l| l.timestamp = 1_000_100);
-
-        // Compute manually: 0 + 100 * 1_000 = 100_000
-        let now = env.ledger().timestamp();
-        let elapsed = (now - stream.last_update) as i128;
-        let live = stream.accumulated + elapsed * stream.flow_rate_per_second;
-        assert_eq!(live, 100_000);
+    /// Deploys with a funded contract and a 10 stroop/s stream for 1,000 s.
+    fn with_stream(env: &Env) -> (StreamingContractClient<'_>, Address) {
+        env.ledger().with_mut(|l| l.timestamp = T0);
+        let (client, _) = deploy(env);
+        let recipient = Address::generate(env);
+        client.create_stream(&recipient, &10, &(T0 + 1_000));
+        (client, recipient)
     }
 
-    /// `get_accumulated` for a Paused stream returns the snapshot value only.
-    #[test]
-    fn get_accumulated_paused_does_not_accrue() {
-        let env = setup_env();
-        let stream = Stream {
-            id: 0,
-            recipient: soroban_sdk::Address::generate(&env),
-            flow_rate_per_second: 1_000,
-            start_time: 1_000_000,
-            end_time: 1_100_000,
-            accumulated: 50_000,
-            last_update: 1_000_050,
-            status: StreamStatus::Paused,
-        };
-
-        // Paused: value stays at accumulated regardless of time
-        match stream.status {
-            StreamStatus::Paused | StreamStatus::Completed => {
-                assert_eq!(stream.accumulated, 50_000);
-            }
-            _ => panic!("unexpected active status"),
-        }
+    fn at(env: &Env, t: u64) {
+        env.ledger().with_mut(|l| l.timestamp = t);
     }
 
-    /// Ceiling-division: 10_000_000 stroops / 2_592_000 seconds rounds up to 4.
     #[test]
-    fn monthly_to_per_second_ceiling_division() {
-        let monthly_stroops: i128 = 10_000_000; // 1 USDC
-        let seconds_per_month: i128 = 2_592_000;
-        let per_sec = (monthly_stroops + seconds_per_month - 1) / seconds_per_month;
-        assert_eq!(per_sec, 4); // ceil(10_000_000 / 2_592_000) = ceil(3.858) = 4
+    fn accrues_linearly_and_stops_at_end_time() {
+        let env = setup_env();
+        let (client, _) = with_stream(&env);
+        at(&env, T0 + 100);
+        assert_eq!(client.get_accumulated(&0), 1_000);
+        at(&env, T0 + 5_000);
+        assert_eq!(client.get_accumulated(&0), 10_000);
+    }
+
+    #[test]
+    fn withdrawals_pay_exactly_what_accrued_and_complete_the_stream() {
+        let env = setup_env();
+        let (client, _) = with_stream(&env);
+        at(&env, T0 + 250);
+        assert_eq!(client.withdraw(&0), 2_500);
+        at(&env, T0 + 2_000);
+        assert_eq!(client.withdraw(&0), 7_500);
+        assert_eq!(client.get_stream(&0).status, StreamStatus::Completed);
+        assert_eq!(client.get_reserved(), 0);
+    }
+
+    #[test]
+    fn pausing_after_end_time_does_not_overpay() {
+        let env = setup_env();
+        let (client, _) = with_stream(&env);
+        at(&env, T0 + 5_000);
+        client.toggle_stream(&0);
+        assert_eq!(client.get_accumulated(&0), 10_000);
+        assert_eq!(client.withdraw(&0), 10_000);
+    }
+
+    #[test]
+    fn paused_time_does_not_accrue() {
+        let env = setup_env();
+        let (client, _) = with_stream(&env);
+        at(&env, T0 + 100);
+        client.toggle_stream(&0); // pause with 1,000 accrued
+        at(&env, T0 + 400);
+        assert_eq!(client.get_accumulated(&0), 1_000);
+        client.toggle_stream(&0); // resume
+        at(&env, T0 + 500);
+        assert_eq!(client.get_accumulated(&0), 2_000);
+    }
+
+    #[test]
+    #[should_panic(expected = "stream has ended")]
+    fn resuming_after_end_time_is_rejected() {
+        let env = setup_env();
+        let (client, _) = with_stream(&env);
+        at(&env, T0 + 100);
+        client.toggle_stream(&0);
+        at(&env, T0 + 2_000);
+        client.toggle_stream(&0);
+    }
+
+    #[test]
+    fn withdrawing_a_paused_stream_after_end_time_completes_it() {
+        let env = setup_env();
+        let (client, _) = with_stream(&env);
+        at(&env, T0 + 100);
+        client.toggle_stream(&0);
+        at(&env, T0 + 2_000);
+        assert_eq!(client.withdraw(&0), 1_000);
+        assert_eq!(client.get_stream(&0).status, StreamStatus::Completed);
+        assert_eq!(client.get_reserved(), 0);
+    }
+
+    #[test]
+    #[should_panic(expected = "nothing to withdraw")]
+    fn double_withdraw_in_the_same_second_panics() {
+        let env = setup_env();
+        let (client, _) = with_stream(&env);
+        at(&env, T0 + 10);
+        client.withdraw(&0);
+        client.withdraw(&0);
+    }
+
+    #[test]
+    #[should_panic(expected = "nothing to withdraw")]
+    fn withdraw_after_completion_panics() {
+        let env = setup_env();
+        let (client, _) = with_stream(&env);
+        at(&env, T0 + 2_000);
+        client.withdraw(&0);
+        at(&env, T0 + 3_000);
+        client.withdraw(&0);
+    }
+
+    #[test]
+    #[should_panic(expected = "stream already completed")]
+    fn toggling_a_completed_stream_panics() {
+        let env = setup_env();
+        let (client, _) = with_stream(&env);
+        at(&env, T0 + 2_000);
+        client.withdraw(&0);
+        client.toggle_stream(&0);
+    }
+
+    #[test]
+    fn only_the_recipient_can_withdraw() {
+        let env = setup_env();
+        let (client, recipient) = with_stream(&env);
+        at(&env, T0 + 10);
+        env.set_auths(&[]);
+        assert!(client.try_withdraw(&0).is_err());
+        env.mock_all_auths();
+        client.withdraw(&0);
+        assert_eq!(env.auths()[0].0, recipient);
+    }
+
+    #[test]
+    fn create_rejects_bad_parameters() {
+        let env = setup_env();
+        let (client, _) = with_stream(&env);
+        let r = Address::generate(&env);
+        assert!(client.try_create_stream(&r, &0, &(T0 + 10)).is_err());
+        assert!(client.try_create_stream(&r, &-5, &(T0 + 10)).is_err());
+        assert!(client.try_create_stream(&r, &1, &T0).is_err());
+        assert!(client.try_create_stream(&r, &1, &(T0 - 1)).is_err());
+    }
+
+    #[test]
+    #[should_panic(expected = "stream total overflows")]
+    fn huge_flow_rates_fail_cleanly() {
+        let env = setup_env();
+        let (client, _) = with_stream(&env);
+        client.create_stream(&Address::generate(&env), &i128::MAX, &(T0 + 10));
+    }
+
+    #[test]
+    fn streams_cannot_promise_the_same_tokens_twice() {
+        let env = setup_env();
+        env.ledger().with_mut(|l| l.timestamp = T0);
+        let admin = Address::generate(&env);
+        let token = env.register_stellar_asset_contract_v2(admin.clone()).address();
+        let id = env.register(StreamingContract, (admin, token.clone()));
+        let client = StreamingContractClient::new(&env, &id);
+        env.mock_all_auths();
+        StellarAssetClient::new(&env, &token).mint(&id, &10_000);
+
+        // 10 stroops/s for 1,000 s reserves the whole balance...
+        client.create_stream(&Address::generate(&env), &10, &(T0 + 1_000));
+        assert_eq!(client.get_reserved(), 10_000);
+        // ...so a second stream must not be able to promise it again.
+        assert!(client.try_create_stream(&Address::generate(&env), &1, &(T0 + 10)).is_err());
+
+        // Withdrawing frees nothing (it was owed), but pausing and resuming
+        // forfeits time, which does free reservation.
+        at(&env, T0 + 100);
+        client.toggle_stream(&0);
+        at(&env, T0 + 300);
+        client.toggle_stream(&0);
+        assert_eq!(client.get_reserved(), 10_000 - 2_000);
+        client.create_stream(&Address::generate(&env), &1, &(T0 + 300 + 2_000));
+        assert_eq!(client.get_reserved(), 10_000);
     }
 }
