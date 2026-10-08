@@ -50,6 +50,8 @@ shieldfund-contracts (Cargo workspace)
 │   ├── toggle_stream()     Active ↔ Paused, snapshots accumulated (auth: admin)
 │   ├── get_accumulated()   simulation call: accumulated + elapsed × rate
 │   ├── withdraw()          recipient claims tokens (auth: recipient)
+│   ├── close_stream()      admin settles an ended stream to its recipient (auth: admin)
+│   ├── reclaim()           admin withdraws unreserved tokens only (auth: admin)
 │   ├── get_stream()        read single Stream record
 │   ├── get_committed() / get_available() / get_reserved()   funding status
 │   ├── get_stream_count() / get_streams(start, limit)   paginated reads
@@ -132,6 +134,8 @@ streaming contract
 | `get_accumulated` | — | `stream_id: u32` | `i128` |
 | `withdraw` | `recipient` | `stream_id: u32` | `i128` (amount paid) |
 | `get_stream` | — | `stream_id: u32` | `Stream` |
+| `close_stream` | `admin` | `stream_id: u32` | `i128` (paid to recipient) |
+| `reclaim` | `admin` | `to: Address`, `amount: i128` | — |
 | `get_committed` | — | — | `i128` (reserved for open streams) |
 | `get_available` | — | — | `i128` (balance − committed) |
 | `get_reserved` | — | `stream_id: u32` | `i128` (unpaid reservation) |
@@ -147,7 +151,9 @@ streaming contract
 **Funding:** `create_stream` reserves `flow_rate × (end_time − now)` and only succeeds if `get_available()`
 covers it, so two streams can never be promised the same tokens. Payouts release their share of the
 reservation; when a stream completes, the unaccrued remainder (e.g. paused time) is released too. A stream
-paused through its end can be closed with a zero-payout `withdraw` after `end_time`.
+paused through its end can be closed with a zero-payout `withdraw` after `end_time`. After `end_time` the admin can also
+`close_stream(id)`, which pays the recipient anything still owed and releases the reservation. `reclaim(to, amount)`
+lets the admin withdraw up to `get_available()`, so it can never touch funds owed to recipients.
 
 **Flow rate formula:** `flow_rate_per_second = ceil(monthly_amount_stroops / 2_592_000)`
 
@@ -204,7 +210,8 @@ Every failure is a typed `contracterror`, surfaced to clients as `Error(Contract
 | 7 | `UnknownProofType` | `Overflow` | |
 | 8 | `InvalidRecipient` | `NoPendingAdmin` | |
 | 9 | `Overflow` | `InvalidPageSize` | |
-| 10 | `NoPendingAdmin` | | |
+| 10 | `NoPendingAdmin` | `InvalidAmount` | |
+| 11 | | `StreamNotEnded` | |
 
 Missing auth still fails with the host's auth error, not a contract error.
 
@@ -222,6 +229,7 @@ of polling. Topics are `(name, key)`:
 | streaming | `("s_toggle", id)` | new `StreamStatus` |
 | streaming | `("s_wdraw", id)` | `(recipient, payout: i128)` |
 | streaming | `("s_done", id)` | `recipient` (stream completed) |
+| streaming | `("reclaim", admin)` | `(to, amount: i128)` |
 | registry | `("p_reg", submitter)` | `(id: u32, proof_hash, public_inputs_hash, proof_type)` |
 | all | `("adm_prop", admin)` | nominee `Address` |
 | all | `("adm_acpt", new_admin)` | previous admin `Address` |
